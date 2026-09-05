@@ -9,6 +9,7 @@ from typing import Callable, Dict, Optional, Tuple
 import httpx
 
 from .errors import DriveError
+from .utils import pick_cookies
 
 # 夸克网页版扫码登录（CAS 协议，参数与开源实现 QuarkPan 对齐）
 _QR_API = "https://uop.quark.cn/cas"
@@ -408,22 +409,23 @@ class BaiduQRLogin:
         return "waiting", None
 
     @staticmethod
-    def clean_cookie(pairs: List[Tuple[str, str]]) -> str:
-        """扔掉 `*_BFESS` 重复键。
+    def clean_cookie(pairs) -> str:
+        """把扫码拿到的一堆 cookie 收敛成一行，同名的挑对的那个。
 
-        百度扫码会同时下发 BDUSS/BDUSS_BFESS、STOKEN/STOKEN_BFESS 两套
-        （BFESS 是它边缘缓存用的副本）。两套一起发过去，服务端有时会判成
-        **未登录**——实测同一份 cookie，`api/list` 正常但 `gettemplatevariable`
-        和 `quota` 报 errno -6「用户未登录」，去掉 _BFESS 后立刻正常。
-        表现是时好时坏，取决于服务端挑中哪一个，很难查。
+        接受 `(name, value)` 或 `(name, value, domain)`。**带上域名很重要**：
+        百度会在 passport 域和 pan 域各发一个**值不同的 STOKEN**，而网盘接口
+        只认 pan 那个。丢掉域名信息去重就是在两个里随便挑一个——挑中 passport
+        的那次，`api/list` 一切正常，但 `gettemplatevariable`（转存要的
+        bdstoken 从它拿）一路 errno -6「用户未登录」。
 
+        这个 bug 会伪装成「登录态过期特别快」：刚扫完能用一会儿，然后就一直 -6，
+        重扫又好了。实测同一账号 passport 版 STOKEN 报 -6、pan 版 errno 0。
+        BaiduPCS-Rust v2.1.6 修的是同一个问题。
+
+        另外扔掉 `*_BFESS` 重复键（BFESS 是百度边缘缓存用的副本），
         只有 `X_BFESS` 而没有 `X` 时把它改名留下，别把凭据丢了。
         """
-        got = {}
-        for name, value in pairs:
-            if not name or not value:
-                continue
-            got.setdefault(name, value)
+        got = pick_cookies(pairs)
         out = {}
         for name, value in got.items():
             base = name[:-6] if name.endswith("_BFESS") else name
@@ -442,10 +444,14 @@ class BaiduQRLogin:
                 "apiver": "v3", "tt": ts, "traceid": "", "time": int(ts / 1000),
                 "alg": "v3",
             })
-            # STOKEN 是访问网盘域名时才下发的，转存接口离了它会报 -4
+            # STOKEN 是访问网盘域名时才下发的，转存接口离了它会报 -4。
+            # 两个地址都走一趟：根路径下发的是 pan 域那个 STOKEN（网盘接口
+            # 认的就是它），/disk/home 是登录后的落地页，少一个都可能拿不全。
+            c.get("https://pan.baidu.com/")
             c.get(_BD_PAN_HOME)
             jar = c.cookies
-        cookie = self.clean_cookie([(c.name, c.value) for c in jar.jar])
+        cookie = self.clean_cookie(
+            [(c.name, c.value, c.domain) for c in jar.jar])
         if "BDUSS=" not in cookie:
             raise DriveError(
                 f"扫码票据没换到 BDUSS（cookie: {cookie[:120] or '空'}）")

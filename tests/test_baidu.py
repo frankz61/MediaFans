@@ -603,3 +603,116 @@ def test_errno_table_has_no_duplicate_keys():
         break
     else:
         raise AssertionError("没找到 _ERRNO_MSG")
+
+
+# ---------------------------------------------------------------- 登录态续期
+def test_pan_domain_stoken_wins_over_passport():
+    """百度在 passport 和 pan 两个域各发一个**值不同**的 STOKEN，网盘只认 pan 那个。
+
+    丢掉域名去重就是在两个里随便挑：挑中 passport 的那次，api/list 一切正常，
+    但 gettemplatevariable 一路 errno -6，看起来就像「登录态过期特别快」。
+    实测同一账号 passport 版报 -6、pan 版 errno 0。
+    """
+    from mediafans.auth import BaiduQRLogin
+
+    got = BaiduQRLogin.clean_cookie([
+        ("BDUSS", "B1", ".baidu.com"),
+        ("STOKEN", "passport-one", ".passport.baidu.com"),
+        ("STOKEN", "pan-one", ".pan.baidu.com"),
+        ("STOKEN", "generic-one", ".baidu.com"),
+    ])
+    assert "STOKEN=pan-one" in got
+    assert "passport-one" not in got and "generic-one" not in got
+
+
+def test_clean_cookie_still_works_without_domains():
+    """用户从浏览器粘过来的那一行 Cookie 没有域名，退化成先到先得就行."""
+    from mediafans.auth import BaiduQRLogin
+
+    got = BaiduQRLogin.clean_cookie([("BDUSS", "B1"), ("STOKEN", "S1")])
+    assert got == "BDUSS=B1; STOKEN=S1"
+
+
+def test_renew_session_swaps_in_the_fresh_pan_stoken():
+    """BDUSS 还活着时，访问一次 pan 域就能换回新的 STOKEN，不用赶用户去重扫。"""
+    def handler(request):
+        if request.url.host == "pan.baidu.com" and request.url.path == "/":
+            r = httpx.Response(200, text="ok")
+            r.headers["set-cookie"] = "STOKEN=fresh-pan; Domain=.pan.baidu.com; Path=/"
+            return r
+        return httpx.Response(200, json={"errno": 0})
+
+    drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=stale"},
+                       transport=httpx.MockTransport(handler))
+    assert drive.renew_session() is True
+    assert "STOKEN=fresh-pan" in drive.cookie
+    assert "stale" not in drive.cookie
+
+
+def test_renew_session_gives_up_when_bduss_is_really_dead():
+    """BDUSS 真死了的话 pan 域不会发新 STOKEN——这时候才该让用户重扫."""
+    def handler(request):
+        return httpx.Response(200, text="login page")
+
+    drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=stale"},
+                       transport=httpx.MockTransport(handler))
+    assert drive.renew_session() is False
+    assert "STOKEN=stale" in drive.cookie
+
+
+def test_errno_minus_6_self_heals_once_then_reports():
+    """撞到 -6 先自己换一次 STOKEN 再问；换完还是 -6 才提示重新扫码。"""
+    calls = {"tpl": 0}
+
+    def handler(request):
+        if request.url.path == "/api/gettemplatevariable":
+            calls["tpl"] += 1
+            if calls["tpl"] == 1:
+                return httpx.Response(200, json={"errno": -6, "result": []})
+            return httpx.Response(200, json={
+                "errno": 0, "result": {"bdstoken": "b" * 32}})
+        if request.url.host == "pan.baidu.com" and request.url.path == "/":
+            r = httpx.Response(200, text="ok")
+            r.headers["set-cookie"] = "STOKEN=fresh-pan; Domain=.pan.baidu.com; Path=/"
+            return r
+        return httpx.Response(200, json={"errno": 0})
+
+    drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=stale"},
+                       transport=httpx.MockTransport(handler))
+    assert drive._bdstoken() == "b" * 32
+    assert calls["tpl"] == 2                 # 第一次 -6，续期后重问一次
+    assert "STOKEN=fresh-pan" in drive.cookie
+
+
+def test_renewed_cookie_is_written_back_to_the_login_file(tmp_path):
+    """续期结果要落盘，不然每次重启都得再续一遍."""
+    f = tmp_path / "baidu.cookie"
+    f.write_text("BDUSS=x; STOKEN=stale", encoding="utf-8")
+
+    def handler(request):
+        if request.url.host == "pan.baidu.com" and request.url.path == "/":
+            r = httpx.Response(200, text="ok")
+            r.headers["set-cookie"] = "STOKEN=fresh-pan; Domain=.pan.baidu.com; Path=/"
+            return r
+        return httpx.Response(200, json={"errno": 0})
+
+    drive = BaiduDrive({"cookie_file": str(f)},
+                       transport=httpx.MockTransport(handler))
+    assert drive.renew_session() is True
+    assert "STOKEN=fresh-pan" in f.read_text(encoding="utf-8")
+
+
+def test_config_cookie_is_never_overwritten(tmp_path):
+    """配置里手填的 cookie 是用户的东西，续期不该去改它."""
+    def handler(request):
+        if request.url.host == "pan.baidu.com" and request.url.path == "/":
+            r = httpx.Response(200, text="ok")
+            r.headers["set-cookie"] = "STOKEN=fresh-pan; Domain=.pan.baidu.com; Path=/"
+            return r
+        return httpx.Response(200, json={"errno": 0})
+
+    f = tmp_path / "baidu.cookie"
+    drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=stale", "cookie_file": str(f)},
+                       transport=httpx.MockTransport(handler))
+    assert drive.renew_session() is True     # 内存里换了
+    assert not f.exists()                    # 但没往文件里写

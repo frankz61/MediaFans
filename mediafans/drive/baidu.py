@@ -10,7 +10,7 @@ import httpx
 from ..errors import ConfigError, DriveError
 from ..models import DriveFile, PlayTarget, StreamVariant
 from ..tokens import TokenRelay
-from ..utils import merge_cookies, norm_path, parse_baidu_share
+from ..utils import merge_cookies, pick_cookies, norm_path, parse_baidu_share
 from .base import BaseDrive, ShareContext
 
 # 各端点要求的 UA 不一样：wxlist 要 netdisk，直链要 pan.baidu.com，其余用浏览器 UA
@@ -186,6 +186,67 @@ class BaiduDrive(BaseDrive):
                 raise DriveError("没取到 bdstoken（转存必需），请重新扫码登录")
         return self._bdstoken_cache
 
+    def renew_session(self) -> bool:
+        """BDUSS 还活着的话，去 pan 域换一份新的 STOKEN 回来。
+
+        网盘接口认的是 **pan 域**下发的 STOKEN，而扫码时 passport 域也会发一个
+        同名不同值的。拿错了的表现是「登录态过期特别快」：`api/list` 一直正常，
+        `gettemplatevariable` 却一路 errno -6。
+
+        只要 BDUSS 没失效，访问一次 `pan.baidu.com` 服务端就会重新下发 pan 域的
+        STOKEN——所以这一步能自愈，不用把用户赶去重新扫码。BDUSS 真的死了时
+        这里会被 302 到登录页，拿不到 STOKEN，返回 False 让调用方去提示重登。
+        """
+        if not self.cookie:
+            return False
+        jar = httpx.Cookies()
+        for pair in self.cookie.split(";"):
+            name, sep, value = pair.strip().partition("=")
+            if sep and name:
+                jar.set(name, value, domain=".baidu.com")
+        try:
+            with httpx.Client(headers={"User-Agent": BROWSER_UA,
+                                       "Referer": "https://pan.baidu.com/"},
+                              cookies=jar, follow_redirects=True,
+                              timeout=self.client.timeout,
+                              transport=self.transport) as c:
+                c.get("https://pan.baidu.com/")
+                fresh = [(k.name, k.value, k.domain) for k in c.cookies.jar]
+        except httpx.HTTPError:
+            return False
+        picked = pick_cookies(fresh)
+        stoken = picked.get("STOKEN") or ""
+        # 拿到的跟手上这个一样，说明服务端没换（多半是 BDUSS 已经不认了）
+        if not stoken or stoken == self._cookie_value("STOKEN"):
+            return False
+        self.cookie = merge_cookies(self.cookie, f"STOKEN={stoken}")
+        self._bdstoken_cache = ""
+        self._persist_cookie()
+        return True
+
+    def _cookie_value(self, name: str) -> str:
+        for pair in (self.cookie or "").split(";"):
+            k, sep, v = pair.strip().partition("=")
+            if sep and k == name:
+                return v
+        return ""
+
+    def _persist_cookie(self) -> None:
+        """续期后的 cookie 写回登录缓存，重启后不用再续一次。
+
+        只写我们自己管的那个文件：配置里手填的 cookie 和 token 中转站
+        都是用户的东西，不该被我们改。
+        """
+        if self.cookie_source != "login":
+            return
+        path = (self.cfg or {}).get("cookie_file")
+        if not path:
+            return
+        try:
+            Path(path).write_text(self.cookie, encoding="utf-8")
+        except OSError:
+            pass          # 存不下只影响下次重启，不该让这次转存挂掉
+
     def _require_stoken(self):
         if "STOKEN=" not in (self.cookie or ""):
             raise ConfigError(
@@ -207,15 +268,20 @@ class BaiduDrive(BaseDrive):
         """
         import json as _json
 
-        body = self._web_api("GET", "/api/gettemplatevariable", params={
-            "clienttype": "0", "app_id": WEB_APP_ID, "web": "1",
-            "fields": _json.dumps(fields),
-        })
+        def ask():
+            return self._web_api("GET", "/api/gettemplatevariable", params={
+                "clienttype": "0", "app_id": WEB_APP_ID, "web": "1",
+                "fields": _json.dumps(fields),
+            })
+
+        body = ask()
+        if body.get("errno") == -6 and self.renew_session():
+            body = ask()          # 换到 pan 域的 STOKEN 之后再问一次
         errno = body.get("errno")
         if errno == -6:
             raise ConfigError(
                 "百度登录态已过期，请重新扫码登录"
-                "（网页端登录态比 cookie 本身短命，转存前需要它）")
+                "（BDUSS 已失效，续期换不回 STOKEN）")
         if errno not in (0, None):
             raise DriveError(f"读取百度登录信息失败: {_errno_msg(errno, body)}")
         result = body.get("result")

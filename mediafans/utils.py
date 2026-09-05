@@ -184,6 +184,39 @@ def merge_cookies(*cookie_headers: str) -> str:
     return "; ".join(f"{k}={v}" for k, v in merged.items())
 
 
+# 同名不同域的 cookie 谁说了算。百度会在 passport 域和 pan 域各发一个
+# **值不同的 STOKEN**，网盘接口只认 pan 那个——拿错了就一路 errno -6。
+_COOKIE_DOMAIN_RANK = (
+    ("pan.baidu.com", 2),        # 网盘自己发的，最权威
+    ("passport.baidu.com", 0),   # 登录系统的同名 cookie 是另一套
+)
+
+
+def cookie_domain_rank(domain: str) -> int:
+    d = (domain or "").lstrip(".").lower()
+    for suffix, rank in _COOKIE_DOMAIN_RANK:
+        if d == suffix or d.endswith("." + suffix):
+            return rank
+    return 1                     # `.baidu.com` 这类通用域，居中
+
+
+def pick_cookies(items) -> dict:
+    """从一堆 (name, value[, domain]) 里挑出每个名字该用哪个值。
+
+    同名时按域名权威度取，权威度相同保留先出现的。没有域名信息（比如用户
+    从浏览器粘过来的那一行 Cookie）时全部同权重，退化成「先到先得」。
+    """
+    best = {}
+    for item in items:
+        name, value = item[0], item[1]
+        if not name or not value:
+            continue
+        rank = cookie_domain_rank(item[2] if len(item) > 2 else "")
+        if name not in best or rank > best[name][0]:
+            best[name] = (rank, value)
+    return {k: v for k, (_, v) in best.items()}
+
+
 def match_tokens(query: str, name: str) -> bool:
     """所有空白分隔的关键词都出现（不区分大小写）才算命中."""
     tokens = [t for t in (query or "").lower().split() if t]
