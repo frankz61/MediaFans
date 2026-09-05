@@ -299,3 +299,181 @@ class QuarkTVLogin:
                 raise DriveError(f"TV 扫码登录失败: {info}")
             time.sleep(poll_interval)
         raise DriveError(f"等待扫码超时（{timeout:.0f} 秒），二维码已失效，请重试")
+
+
+# ---------------------------------------------------------------------------
+# 百度网盘扫码登录（passport 的标准扫码通道，tpl=netdisk）
+# ---------------------------------------------------------------------------
+_BD_PASSPORT = "https://passport.baidu.com"
+_BD_PAN_HOME = "https://pan.baidu.com/disk/home"
+
+
+def _bd_gid() -> str:
+    """passport 用的设备标识：大写十六进制 UUID。整个登录过程要用同一个。"""
+    return str(uuid.uuid4()).upper()
+
+
+def _jsonp(text: str) -> dict:
+    """passport 的响应可能裹在 JSONP 回调里，也可能是裸 JSON。"""
+    import json as _json
+
+    s = (text or "").strip()
+    if not s:
+        return {}
+    if not s.startswith("{"):
+        l, r = s.find("("), s.rfind(")")
+        if l >= 0 and r > l:
+            s = s[l + 1:r]
+    try:
+        return _json.loads(s)
+    except ValueError:
+        return {}
+
+
+class BaiduQRLogin:
+    """百度扫码登录：取二维码 -> 轮询 -> 用临时票据换正式 cookie。
+
+    和网页版「扫码登录」走的是同一套 passport 接口。拿到的 cookie 必须同时含
+    **BDUSS 和 STOKEN**——转存接口 share/transfer 要 STOKEN，只有 BDUSS 会报 errno -4，
+    所以最后要再访问一次网盘首页把 STOKEN 领回来。
+
+    整个流程共用一个 cookie jar：passport 分几步下发 cookie，
+    每步都新建 client 的话前一步的 BDUSS 会丢。
+    """
+
+    def __init__(self, timeout: float = 15.0, transport=None):
+        self.timeout = timeout
+        self.transport = transport
+        self.gid = _bd_gid()
+        self.jar = httpx.Cookies()
+
+    def _client(self, timeout: Optional[float] = None) -> httpx.Client:
+        headers = dict(_BROWSER_HEADERS)
+        headers["referer"] = "https://pan.baidu.com/"
+        return httpx.Client(
+            headers=headers, timeout=timeout or self.timeout,
+            transport=self.transport, cookies=self.jar, follow_redirects=True,
+        )
+
+    def get_qr_code(self) -> Tuple[str, str]:
+        """返回 (sign, 二维码图片 URL)。百度直接给图片地址，不用本地渲染。"""
+        ts = int(time.time() * 1000)
+        with self._client() as c:
+            r = c.get(f"{_BD_PASSPORT}/v2/api/getqrcode", params={
+                "lp": "pc", "qrloginfrom": "pc", "gid": self.gid,
+                "apiver": "v3", "tt": ts, "tpl": "netdisk", "_": ts,
+            })
+            r.raise_for_status()
+            body = _jsonp(r.text)
+        sign = str(body.get("sign") or "")
+        img = str(body.get("imgurl") or "")
+        if not sign or not img:
+            raise DriveError(f"获取百度登录二维码失败: {str(body)[:200] or '响应为空'}")
+        if not img.startswith("http"):
+            img = "https://" + img.lstrip("/")
+        return sign, img
+
+    # unicast 是长轮询：没事件时会一直挂着连接。用短超时问一次，
+    # 超时就是「还没动静」，不是错误——否则每次轮询都要卡住调用方几十秒。
+    POLL_TIMEOUT = 6.0
+
+    def poll_once(self, sign: str) -> Tuple[str, Optional[str]]:
+        """查一次: ("waiting", 提示) | ("success", 临时票据) | ("failed", 原因)."""
+        ts = int(time.time() * 1000)
+        try:
+            with self._client(timeout=self.POLL_TIMEOUT) as c:
+                r = c.get(f"{_BD_PASSPORT}/channel/unicast", params={
+                    "channel_id": sign, "gid": self.gid, "tpl": "netdisk",
+                    "apiver": "v3", "tt": ts, "_": ts,
+                })
+                r.raise_for_status()
+                body = _jsonp(r.text)
+        except httpx.TimeoutException:
+            return "waiting", None
+        except httpx.HTTPError as e:
+            # 网络抖动不该把二维码作废，交给上层的总超时兜底
+            return "waiting", None if not str(e) else None
+        errno = body.get("errno")
+        if errno not in (0, None):
+            # 1 = 还没人扫，这是等待不是失败
+            if str(errno) == "1":
+                return "waiting", None
+            return "failed", f"errno={errno} {body.get('errmsg') or ''}".strip()
+        inner = _jsonp(str(body.get("channel_v") or ""))
+        status = inner.get("status")
+        if status == 0 and inner.get("v"):
+            return "success", str(inner["v"])
+        if status == 1:
+            return "waiting", "已扫码，请在手机上确认登录"
+        return "waiting", None
+
+    @staticmethod
+    def clean_cookie(pairs: List[Tuple[str, str]]) -> str:
+        """扔掉 `*_BFESS` 重复键。
+
+        百度扫码会同时下发 BDUSS/BDUSS_BFESS、STOKEN/STOKEN_BFESS 两套
+        （BFESS 是它边缘缓存用的副本）。两套一起发过去，服务端有时会判成
+        **未登录**——实测同一份 cookie，`api/list` 正常但 `gettemplatevariable`
+        和 `quota` 报 errno -6「用户未登录」，去掉 _BFESS 后立刻正常。
+        表现是时好时坏，取决于服务端挑中哪一个，很难查。
+
+        只有 `X_BFESS` 而没有 `X` 时把它改名留下，别把凭据丢了。
+        """
+        got = {}
+        for name, value in pairs:
+            if not name or not value:
+                continue
+            got.setdefault(name, value)
+        out = {}
+        for name, value in got.items():
+            base = name[:-6] if name.endswith("_BFESS") else name
+            if name.endswith("_BFESS") and base in got:
+                continue          # 正本还在，副本丢掉
+            out.setdefault(base, value)
+        return "; ".join(f"{k}={v}" for k, v in out.items())
+
+    def exchange(self, tmp_ticket: str) -> str:
+        """用扫码票据换正式 cookie（BDUSS + STOKEN）."""
+        ts = int(time.time() * 1000)
+        with self._client() as c:
+            c.get(f"{_BD_PASSPORT}/v3/login/main/qrbdusslogin", params={
+                "v": ts, "bduss": tmp_ticket, "u": _BD_PAN_HOME,
+                "loginVersion": "v4", "qrcode": "1", "tpl": "netdisk",
+                "apiver": "v3", "tt": ts, "traceid": "", "time": int(ts / 1000),
+                "alg": "v3",
+            })
+            # STOKEN 是访问网盘域名时才下发的，转存接口离了它会报 -4
+            c.get(_BD_PAN_HOME)
+            jar = c.cookies
+        cookie = self.clean_cookie([(c.name, c.value) for c in jar.jar])
+        if "BDUSS=" not in cookie:
+            raise DriveError(
+                f"扫码票据没换到 BDUSS（cookie: {cookie[:120] or '空'}）")
+        if "STOKEN=" not in cookie:
+            raise DriveError(
+                "只拿到 BDUSS 没拿到 STOKEN，转存会失败。"
+                "这通常是百度对该账号做了额外校验，请改用「粘贴 cookie」方式")
+        return cookie
+
+    def login(self, on_qr: Optional[Callable[[str], None]] = None,
+              on_event: Optional[Callable[[str], None]] = None,
+              poll_interval: float = 2.0, timeout: float = 180.0) -> str:
+        tell = on_event or (lambda m: None)
+        sign, img = self.get_qr_code()
+        if on_qr:
+            on_qr(img)
+        tell("请用百度网盘 APP 扫描二维码…")
+        deadline = time.time() + timeout
+        said = False
+        while time.time() < deadline:
+            state, info = self.poll_once(sign)
+            if state == "success":
+                tell("扫码确认成功，正在换取 cookie…")
+                return self.exchange(info)
+            if state == "failed":
+                raise DriveError(f"百度扫码登录失败: {info}")
+            if info and not said:
+                tell(info)
+                said = True
+            time.sleep(poll_interval)
+        raise DriveError(f"等待扫码超时（{timeout:.0f} 秒），请重试")

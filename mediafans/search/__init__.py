@@ -33,7 +33,15 @@ def build_providers(cfg_section: dict, transport=None) -> List[SearchProvider]:
 
 def aggregate_search(providers: List[SearchProvider], kw: str,
                      netdisk: Optional[str] = None) -> Tuple[List[ShareLink], List[Tuple[str, Exception]]]:
-    """并发搜所有源，按 URL 去重，夸克结果排前面（当前只有夸克可转存）."""
+    """并发搜所有源，按 URL 去重，可转存的网盘（夸克/百度）排前面."""
+
+    # 可转存（搜索→转存→直链播放全链路通）的网盘优先展示，组内按列表顺序（夸克仍是主力）
+    _TRANSFERABLE = ("quark", "baidu")
+
+    def _order(r: ShareLink):
+        if r.netdisk in _TRANSFERABLE:
+            return (0, _TRANSFERABLE.index(r.netdisk), r.url)
+        return (1, 0, r.url)
     results: List[ShareLink] = []
     errors: List[Tuple[str, Exception]] = []
 
@@ -57,7 +65,7 @@ def aggregate_search(providers: List[SearchProvider], kw: str,
             continue
         seen.add(key)
         unique.append(r)
-    unique.sort(key=lambda r: (0 if r.netdisk == "quark" else 1, r.url))
+    unique.sort(key=_order)
     return unique, errors
 
 

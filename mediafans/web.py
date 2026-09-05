@@ -5,6 +5,7 @@ import dataclasses
 import io
 import json
 import threading
+import time
 from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -16,7 +17,7 @@ from .drive.base import BaseDrive
 from .errors import MediaFansError
 from .models import PlayTarget
 from .proxy import QuietThreadingHTTPServer, relay_stream
-from .utils import fmt_size, is_playable, media_kind, norm_path
+from .utils import classify_netdisk, fmt_size, is_playable, media_kind, norm_path, normalize_netdisk
 
 # 转码档只给容器名，原画给的是网盘的 format_type（已是 mime）
 _CONTAINER_MIME = {"mp4": "video/mp4", "fmp4": "video/mp4",
@@ -129,15 +130,19 @@ class WebApp:
     页面和播放地址同源（127.0.0.1），对使用者完全透明。
     """
 
-    def __init__(self, drive_factory: Callable[[], BaseDrive],
+    def __init__(self, drive_factory: Callable[..., BaseDrive],
                  search_fn: Optional[Callable] = None,
                  host: str = "127.0.0.1", port: int = 0,
                  cookie_path: Optional[Path] = None,
+                 cookie_paths: Optional[dict] = None,
                  tv_token_path: Optional[Path] = None,
+                 baidu_token_path: Optional[Path] = None,
+                 baidu_oauth_cfg: Optional[dict] = None,
                  token: str = "", use_tv: bool = True,
                  tmdb_key: str = "", picker=None,
                  watch_path: Optional[Path] = None,
                  prefer_chinese: bool = True):
+        # drive_factory(nd) -> BaseDrive，按网盘建驱动（nd: quark | baidu）
         self.drive_factory = drive_factory
         self.search_fn = search_fn  # fn(kw, netdisk) -> (links, errors)
         self.host = host
@@ -145,14 +150,22 @@ class WebApp:
         # 还能用你的 cookie 取流，裸奔到局域网等于把网盘交出去
         self.token = token or ""
         self.cookie_path = Path(cookie_path) if cookie_path else None
+        # 各网盘的 cookie 落盘位置（重新登录后失效对应驱动用）
+        self.cookie_paths = {k: Path(v) for k, v in (cookie_paths or {}).items()
+                             if v}
+        if self.cookie_path and "quark" not in self.cookie_paths:
+            self.cookie_paths["quark"] = self.cookie_path
         self.tv_token_path = Path(tv_token_path) if tv_token_path else None
+        self.baidu_token_path = Path(baidu_token_path) if baidu_token_path else None
+        self.baidu_oauth_cfg = dict(baidu_oauth_cfg or {})
         self.use_tv = use_tv
         self.tmdb_key = tmdb_key or ""
         # 追剧榜和搜索都优先华语内容（config: tmdb.prefer_chinese）
         self.prefer_chinese = bool(prefer_chinese)
         self.picker = picker
         self._tv = None
-        self._tv_failed = ""     # TV 这条路挂了的原因，挂过就不再每次重试
+        self._tv_failed = ""     # TV 这条路挂了的原因
+        self._tv_failed_at = 0.0  # 什么时候挂的——过了冷却期要再给它一次机会
         self.registry = _PlayRegistry()
         self.logins = _LoginSessions()
         self.jobs = _AutoJobs()
@@ -166,16 +179,35 @@ class WebApp:
 
         self.watch = WatchStore(Path(watch_path) if watch_path
                                 else Path.home() / ".mediafans" / "watch.json")
-        self._drive: Optional[BaseDrive] = None
+        self._drives: dict = {}
         self._thread: Optional[threading.Thread] = None
         self._server = QuietThreadingHTTPServer((host, port), self._make_handler())
 
     # ------------------------------------------------------------------ app
+    SUPPORTED_NETDISKS = ("quark", "baidu")
+
+    def _drive_for(self, netdisk: str) -> BaseDrive:
+        """按网盘取（并缓存）驱动。凭据失效重登后调 invalidate_drive."""
+        nd = normalize_netdisk(netdisk or "quark")
+        if nd not in self.SUPPORTED_NETDISKS:
+            raise MediaFansError(f"暂不支持网盘 '{nd}'（当前: {' | '.join(self.SUPPORTED_NETDISKS)}）")
+        if nd not in self._drives:
+            self._drives[nd] = self.drive_factory(nd)
+        return self._drives[nd]
+
+    def _nd_of(self, val) -> str:
+        """只归一化+校验网盘名，不实例化驱动（跑后台任务时再按需建）."""
+        nd = normalize_netdisk(str(val or "quark"))
+        if nd not in self.SUPPORTED_NETDISKS:
+            raise MediaFansError(f"暂不支持网盘 '{nd}'（当前: {' | '.join(self.SUPPORTED_NETDISKS)}）")
+        return nd
+
+    def invalidate_drive(self, netdisk: str) -> None:
+        self._drives.pop(normalize_netdisk(netdisk or "quark"), None)
+
     @property
     def drive(self) -> BaseDrive:
-        if self._drive is None:
-            self._drive = self.drive_factory()
-        return self._drive
+        return self._drive_for("quark")
 
     @property
     def port(self) -> int:
@@ -202,14 +234,27 @@ class WebApp:
             self._thread.join(timeout=5)
             self._thread = None
 
+    # TV 挂了之后多久再试一次。
+    # 不能永久记住失败：TV 直链是浏览器直连 CDN（实测 5-7 MB/s），
+    # 退回代理要经这台服务器中转，实测只有 0.85 MB/s 还带秒级停顿。
+    # 一次网络抖动就把之后**所有**播放永久降级到那条慢路上，
+    # 表现就是「有时候会卡，重启就好了」——这种粘性失败最难查。
+    TV_RETRY_AFTER = 300.0
+
     @property
     def tv(self):
-        """TV 版客户端（拿得到免凭据直链）。没 token / 报过错就返回 None，走代理兜底。"""
-        if not self.use_tv or self._tv_failed:
+        """TV 版客户端（拿得到免凭据直链）。挂过就暂时走代理兜底，冷却后重试。"""
+        if not self.use_tv:
             return None
+        if self._tv_failed:
+            if time.time() - self._tv_failed_at < self.TV_RETRY_AFTER:
+                return None
+            self._tv_failed = ""      # 冷却结束，重新试一次
+            self._tv = None
         if self._tv is None:
             if not self.tv_token_path or not self.tv_token_path.exists():
                 self._tv_failed = "没有 TV token（mediafans login --tv 可扫码获取）"
+                self._tv_failed_at = time.time()
                 return None
             try:
                 from .drive.quark_tv import QuarkTVClient
@@ -217,17 +262,37 @@ class WebApp:
                 self._tv = QuarkTVClient(self.tv_token_path)
             except Exception as e:
                 self._tv_failed = str(e)
+                self._tv_failed_at = time.time()
                 return None
         return self._tv
 
     # ------------------------------------------------------------------ api
-    def api_list(self, raw_path: str) -> dict:
-        path = norm_path(unquote(raw_path)) if raw_path else norm_path(self.drive.save_dir)
-        fid = self.drive.resolve_path(path)
+    @staticmethod
+    def _watch_key(path: str, nd: str) -> str:
+        """进度键。夸克用裸路径（兼容旧 watch.json），其他网盘加前缀防撞."""
+        nd = normalize_netdisk(nd or "quark")
+        return path if nd == "quark" else f"{nd}:{path}"
+
+    @staticmethod
+    def _watch_parse(mark_dict: dict) -> dict:
+        """把进度记录里的网盘前缀拆出来，前端才知道去哪个盘接着播."""
+        path = str(mark_dict.get("path") or "")
+        for nd in ("baidu",):
+            if path.startswith(f"{nd}:"):
+                mark_dict = dict(mark_dict, netdisk=nd,
+                                 play_path=path[len(nd) + 1:])
+                return mark_dict
+        return dict(mark_dict, netdisk="quark", play_path=path)
+
+    def api_list(self, raw_path: str, nd: str = "quark") -> dict:
+        drive = self._drive_for(nd)
+        nd = drive.name
+        path = norm_path(unquote(raw_path)) if raw_path else norm_path(drive.save_dir)
+        fid = drive.resolve_path(path)
         if not fid:
             raise MediaFansError(f"目录不存在: {path}")
         files: List[dict] = []
-        for f in self.drive.list_files(fid):
+        for f in drive.list_files(fid):
             files.append({
                 "name": f.name,
                 "is_dir": f.is_dir,
@@ -239,38 +304,41 @@ class WebApp:
                 "path": (path.rstrip("/") + "/" + f.name) if path != "/" else "/" + f.name,
             })
             if files[-1]["playable"]:
-                w = self._mark_of(files[-1]["path"])
+                w = self._mark_of(files[-1]["path"], nd)
                 if w:
                     files[-1]["watched"] = w
         files.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
-        return {"path": path, "files": files}
+        return {"path": path, "netdisk": nd, "files": files}
 
-    def api_play(self, raw_path: str) -> dict:
+    def api_play(self, raw_path: str, nd: str = "quark") -> dict:
         """取播放地址。优先走 TV 版直链，浏览器直连网盘 CDN，不经本机转发。
 
         PC 版直链必须带 Cookie，而 <video> 发不出 Cookie，所以只能本地转发；
         TV 版走 OAuth，直链本身免凭据（实测裸请求 206），浏览器可以直接播。
         每一档同时给出直链和代理地址，直链万一被拒（比如 Referer 泄漏）前端能就地回退。
         """
+        drive = self._drive_for(nd)
+        nd = drive.name
         path = norm_path(unquote(raw_path))
         name = path.rsplit("/", 1)[-1]
-        fid = self.drive.resolve_entry(path)
+        fid = drive.resolve_entry(path)
         if not fid:
             raise MediaFansError(f"文件不存在: {path}")
 
         direct = False
         target = None
-        tv = self.tv
+        tv = self.tv if nd == "quark" else None
         if tv is not None:
             try:
                 target = tv.get_play_target(fid, name=name)
                 direct = True
             except Exception as e:
-                # TV 挂了（token 过期、设备数超限…）就记下原因，本次和之后都退回代理
+                # TV 挂了（token 过期、设备数超限…）先退回代理，冷却后自己再试
                 self._tv_failed = str(e)
+                self._tv_failed_at = time.time()
                 target = None
         if target is None:
-            target = self.drive.get_play_target(fid, name=name)
+            target = drive.get_play_target(fid, name=name)
 
         streams = []
         for v in target.variants:
@@ -293,6 +361,7 @@ class WebApp:
                            streams[0]["url"] if streams else "")
         return {
             "file_name": target.file_name or name,
+            "netdisk": nd,
             "stream_url": default_url,
             "streams": streams,
             "default_key": default_key,
@@ -305,10 +374,15 @@ class WebApp:
     # ------------------------------------------------------------------ 扫码登录
     def api_login_start(self, kind: str) -> dict:
         """开一个扫码会话。quark = 网页版（存 cookie），tv = TV 版（存 token）."""
-        from .auth import QuarkQRLogin, QuarkTVLogin
+        from .auth import BaiduQRLogin, QuarkQRLogin, QuarkTVLogin
 
         kind = (kind or "quark").strip().lower()
-        if kind == "tv":
+        if kind == "baidu":
+            if not self.cookie_paths.get("baidu"):
+                raise MediaFansError("没有配置百度 cookie 存放位置")
+            flow = BaiduQRLogin()
+            handle, qr = flow.get_qr_code()      # 百度直接给图片地址
+        elif kind == "tv":
             if self.tv_token_path is None:
                 raise MediaFansError("没有配置 TV token 存放位置")
             flow = QuarkTVLogin(device_id=self._existing_device_id())
@@ -341,9 +415,26 @@ class WebApp:
             raise MediaFansError("登录会话已失效，请重新点登录")
         state, info = item["flow"].poll_once(item["handle"])
         if state == "waiting":
-            return {"state": "waiting"}
+            # 「已扫码，等确认」也是等待，但得让用户知道该去手机上点确认
+            return {"state": "waiting", "message": info or ""}
         if state == "failed":
             return {"state": "failed", "message": info or "扫码失败"}
+        if item["kind"] == "baidu":
+            cookie = item["flow"].exchange(info)
+            path = self.cookie_paths["baidu"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(cookie, encoding="utf-8")
+            self.invalidate_drive("baidu")
+            name = ""
+            try:
+                name = self._drive_for("baidu").account_name()
+            except Exception:
+                # cookie 已经落盘了，昵称取不到多半是还没配 OAuth，
+                # 不该把登录报成失败
+                pass
+            return {"state": "success", "kind": "baidu",
+                    "message": f"百度已登录{('：' + name) if name else ''}，"
+                               f"cookie 已保存（可打开分享、转存）"}
         if item["kind"] == "tv":
             token = item["flow"].exchange_code(info)
             self.tv_token_path.parent.mkdir(parents=True, exist_ok=True)
@@ -354,7 +445,7 @@ class WebApp:
         cookie = item["flow"].exchange_ticket(info)
         self.cookie_path.parent.mkdir(parents=True, exist_ok=True)
         self.cookie_path.write_text(cookie, encoding="utf-8")
-        self._drive = None  # 让下次请求用新 cookie 重建驱动
+        self.invalidate_drive("quark")  # 让下次请求用新 cookie 重建驱动
         name = ""
         try:
             name = self.drive.account_name()
@@ -362,6 +453,40 @@ class WebApp:
             pass  # cookie 已经落盘了，昵称只是好看，取不到也不能把登录报成失败
         return {"state": "success", "kind": "quark",
                 "message": f"已登录{('：' + name) if name else ''}，cookie 已保存"}
+
+    def api_login_baidu(self, payload: Optional[dict] = None) -> dict:
+        """百度「粘贴 cookie」——扫码失败时的备用通道。
+
+        主路是扫码（api_login_start('baidu')）。这里不再有 OAuth：官方开放平台
+        把第三方应用锁死在 /apps/{应用名}，够不到用户自己的目录，那条路走不通。
+
+        GET 语义（payload 为空）：返回当前状态，前端据此渲染表单。
+        POST 语义：存 cookie 并让驱动缓存失效。
+        """
+        from .auth import BaiduQRLogin
+
+        payload = payload or {}
+        path = self.cookie_paths.get("baidu")
+        has_cookie = bool(path and path.exists())
+        if not payload:
+            return {"has_cookie": has_cookie}
+        cookie = str(payload.get("cookie") or "").strip()
+        if not cookie:
+            raise MediaFansError("请粘贴 Cookie")
+        if "BDUSS=" not in cookie:
+            raise MediaFansError("cookie 里没有 BDUSS，请复制完整的 Cookie 头")
+        if not path:
+            raise MediaFansError("没有配置百度 cookie 存放位置")
+        pairs = [(kv.split("=", 1)[0].strip(), kv.split("=", 1)[1].strip())
+                 for kv in cookie.split(";") if "=" in kv]
+        cookie = BaiduQRLogin.clean_cookie(pairs)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(cookie, encoding="utf-8")
+        self.invalidate_drive("baidu")
+        msg = "cookie 已保存"
+        if "STOKEN=" not in cookie:
+            msg += "，但缺 STOKEN，转存会失败（浏览和播放不受影响）"
+        return {"ok": True, "message": msg}
 
     # ------------------------------------------------------------------ 追剧
     @property
@@ -428,15 +553,15 @@ class WebApp:
             "overview": i.overview, "poster": i.poster, "tmdb_id": i.tmdb_id,
         } for i in items if i.tmdb_id]}
 
-    def _mark_of(self, path: str) -> Optional[dict]:
-        m = self.watch.get(path) if path else None
+    def _mark_of(self, path: str, nd: str = "quark") -> Optional[dict]:
+        m = self.watch.get(self._watch_key(path, nd)) if path else None
         if not m:
             return None
         return {"percent": m.percent, "finished": m.finished,
                 "resume_at": m.resume_at, "position": m.position,
                 "duration": m.duration}
 
-    def _attach_watch(self, data: dict) -> dict:
+    def _attach_watch(self, data: dict, nd: str = "quark") -> dict:
         """把「看到哪儿了」附到列表上。
 
         列出可播放文件的地方都带上，进度才在哪儿都看得见——
@@ -444,7 +569,7 @@ class WebApp:
         """
         for ep in data.get("episodes", []):
             loc = ep.get("local") or {}
-            w = self._mark_of(loc.get("path", ""))
+            w = self._mark_of(loc.get("path", ""), nd)
             if w:
                 ep["watched"] = w
         return data
@@ -460,12 +585,13 @@ class WebApp:
                 meta[k] = int(payload[k]) if payload.get(k) is not None else None
             except (TypeError, ValueError):
                 meta[k] = None
-        m = self.watch.save(path, float(payload.get("position") or 0),
+        key = self._watch_key(path, str(payload.get("netdisk") or "quark"))
+        m = self.watch.save(key, float(payload.get("position") or 0),
                             float(payload.get("duration") or 0), **meta)
         return {"ok": True, "mark": m.as_dict()}
 
-    def api_watch_get(self, path: str) -> dict:
-        m = self.watch.get(path)
+    def api_watch_get(self, path: str, nd: str = "quark") -> dict:
+        m = self.watch.get(self._watch_key(unquote(path or ""), nd))
         return {"mark": m.as_dict() if m else None}
 
     def api_watch_recent(self, limit: int = 12) -> dict:
@@ -473,12 +599,15 @@ class WebApp:
             n = max(1, min(50, int(limit)))
         except (TypeError, ValueError):
             n = 12
-        return {"items": [m.as_dict() for m in self.watch.recent(n)]}
+        return {"items": [self._watch_parse(m.as_dict())
+                          for m in self.watch.recent(n)]}
 
     def api_watch_forget(self, payload: dict) -> dict:
+        # 前端传的 path 就是存储键（baidu 带前缀），按原样删
         return {"ok": self.watch.forget(str(payload.get("path") or ""))}
 
-    def api_series(self, tmdb_id: int, season: int, refresh: bool = False) -> dict:
+    def api_series(self, tmdb_id: int, season: int, refresh: bool = False,
+                   nd: str = "quark") -> dict:
         """一季的剧集矩阵。
 
         只扫网盘、不搜资源——首屏要快（1 秒内）。找缺失集的来源很慢
@@ -488,21 +617,23 @@ class WebApp:
 
         if not self.tmdb:
             raise MediaFansError("未配置 tmdb.api_key")
-        key = (int(tmdb_id), int(season))
+        nd = self._nd_of(nd)
+        key = (nd, int(tmdb_id), int(season))
         if not refresh:
             cached = self.series_cache.get(key)
             if cached is not None:
                 # 进度变得快，缓存的是剧集结构，看没看过每次都现取
-                return self._attach_watch(dict(cached.as_dict(), cached=True))
+                return self._attach_watch(dict(cached.as_dict(), cached=True), nd)
         try:
-            view = build_series(self.drive_factory, None, self.tmdb,
-                                int(tmdb_id), int(season), with_sources=False)
+            view = build_series(lambda: self._drive_for(nd), None, self.tmdb,
+                                int(tmdb_id), int(season), with_sources=False,
+                                netdisk=nd)
         except MediaFansError:
             raise
         except Exception as e:
             raise MediaFansError(f"读取剧集信息失败: {str(e)[:120]}")
         self.series_cache.put(key, view)
-        return self._attach_watch(dict(view.as_dict(), cached=False))
+        return self._attach_watch(dict(view.as_dict(), cached=False), nd)
 
     def api_series_scan(self, payload: dict) -> dict:
         """开一个后台任务：搜资源并把每一集能从哪补铺开。"""
@@ -515,12 +646,13 @@ class WebApp:
             raise MediaFansError("未配置 tmdb.api_key")
         if self.search_fn is None:
             raise MediaFansError("未配置搜索源")
+        nd = self._nd_of(payload.get("netdisk"))
 
         def runner(on_step):
-            view = build_series(self.drive_factory, self.search_fn, self.tmdb,
-                                tmdb_id, season, on_step=on_step)
-            self.series_cache.put((tmdb_id, season), view)
-            return self._attach_watch(view.as_dict())
+            view = build_series(lambda: self._drive_for(nd), self.search_fn, self.tmdb,
+                                tmdb_id, season, on_step=on_step, netdisk=nd)
+            self.series_cache.put((nd, tmdb_id, season), view)
+            return self._attach_watch(view.as_dict(), nd)
 
         return {"job": self.jobs.start(runner)}
 
@@ -531,7 +663,8 @@ class WebApp:
         tmdb_id, season = int(payload.get("tmdb_id") or 0), int(payload.get("season") or 0)
         episode = int(payload.get("episode") or 0)
         index = int(payload.get("index") or 0)
-        view = self.series_cache.get((tmdb_id, season))
+        nd = self._nd_of(payload.get("netdisk"))
+        view = self.series_cache.get((nd, tmdb_id, season))
         if view is None:
             raise MediaFansError("这一季的资源信息已过期，请重新扫描")
         row = next((r for r in view.rows if r.episode == episode), None)
@@ -543,7 +676,7 @@ class WebApp:
             raise MediaFansError("这个来源不存在了，请重新扫描")
         src = row.sources[index]
         try:
-            path = fetch_episode(self.drive_factory, src, view.local_dir)
+            path = fetch_episode(lambda: self._drive_for(nd), src, view.local_dir)
         except Exception as e:
             raise MediaFansError(f"转存失败: {str(e)[:140]}")
         # 存完就地更新缓存，前端不用重新扫
@@ -551,7 +684,7 @@ class WebApp:
 
         row.local = LocalFile(path=path, name=src.file.name, size=src.file.size,
                               height=src.file.height, source=src.file.source)
-        self.series_cache.put((tmdb_id, season), view)
+        self.series_cache.put((nd, tmdb_id, season), view)
         return {"path": path, "already": False, "name": src.file.name}
 
     def api_season_fetch(self, payload: dict) -> dict:
@@ -563,7 +696,8 @@ class WebApp:
         from .agent import LocalFile, fetch_batch, plan_batch
 
         tmdb_id, season = int(payload.get("tmdb_id") or 0), int(payload.get("season") or 0)
-        view = self.series_cache.get((tmdb_id, season))
+        nd = self._nd_of(payload.get("netdisk"))
+        view = self.series_cache.get((nd, tmdb_id, season))
         if view is None:
             raise MediaFansError("这一季的资源信息已过期，请重新扫描")
         want = [int(e) for e in (payload.get("episodes") or [])]
@@ -576,9 +710,9 @@ class WebApp:
             on_step("plan", {"message":
                              f"用 {len(groups)} 个来源补 "
                              f"{sum(len(g.episodes) for g in groups)} 集"})
-            res = fetch_batch(self.drive_factory, groups, view.local_dir, on_step)
+            res = fetch_batch(lambda: self._drive_for(nd), groups, view.local_dir, on_step)
             # 存完就地更新缓存，前端不用重新扫一遍
-            live = self.series_cache.get((tmdb_id, season)) or view
+            live = self.series_cache.get((nd, tmdb_id, season)) or view
             done = set(res.saved) | set(res.skipped)
             for r in live.rows:
                 if r.episode in done and not r.local:
@@ -589,7 +723,7 @@ class WebApp:
                         path=res.paths[r.episode], name=res.names[r.episode],
                         size=f.size if f else 0, height=f.height if f else 0,
                         source=f.source if f else "")
-            self.series_cache.put((tmdb_id, season), live)
+            self.series_cache.put((nd, tmdb_id, season), live)
             out = self._attach_watch(live.as_dict())
             out["batch"] = res.as_dict()
             return out
@@ -607,6 +741,7 @@ class WebApp:
         season = int(season) if season not in (None, "", 0) else None
         tmdb_id = int(payload.get("tmdb_id") or 0)
         do_save = bool(payload.get("save", True))
+        nd = self._nd_of(payload.get("netdisk"))
 
         def runner(on_step):
             from .agent import auto_fetch
@@ -635,13 +770,15 @@ class WebApp:
                                      f"{d['total_episodes']} 集"})
                 except Exception:
                     pass    # 元数据只是加分项
-            res = auto_fetch(self.drive_factory, self.search_fn, name,
+            res = auto_fetch(lambda: self._drive_for(nd), self.search_fn, name,
                              year=year, season=season, episodes=episodes,
+                             netdisk=nd,
                              picker=self.picker, do_save=do_save, work=work,
                              on_step=lambda st, info: on_step(st, info))
             return {
                 "ok": res.ok,
                 "error": res.error,
+                "netdisk": nd,
                 "saved": res.saved,
                 "already": res.already,
                 "saved_dir": res.saved_dir,
@@ -703,14 +840,14 @@ class WebApp:
         以前只列顶层，用户看到一个空文件夹就卡住了。这里会自动往下钻过那些
         「没有文件、只有唯一子目录」的层，直接把人送到有东西的地方，路径记在面包屑里。
         """
-        from .utils import parse_quark_share
-
-        if not parse_quark_share(url or ""):
-            raise MediaFansError("不是有效的夸克分享链接")
-        ctx = self.drive.open_share(url, passcode=code or "")
+        nd = classify_netdisk(url or "")
+        if nd not in self.SUPPORTED_NETDISKS:
+            raise MediaFansError("不是有效的夸克/百度分享链接")
+        drive = self._drive_for(nd)
+        ctx = drive.open_share(url, passcode=code or "")
         fid = dir_fid or "0"
         trail = [x for x in (crumb or "").split("/") if x]
-        entries = self.drive.list_share_files(ctx, fid)
+        entries = drive.list_share_files(ctx, fid)
         for _ in range(SHARE_AUTO_DESCEND_MAX):
             dirs = [f for f in entries if f.is_dir]
             if any(not f.is_dir for f in entries) or len(dirs) != 1:
@@ -734,7 +871,7 @@ class WebApp:
         files.sort(key=lambda x: (not x["is_dir"], x["name"].lower()))
         playable = [f for f in files if f["playable"]]
         return {
-            "url": url, "code": code or "",
+            "url": url, "code": code or "", "netdisk": nd,
             "dir_fid": fid, "crumb": "/".join(trail),
             "files": files,
             "counts": {
@@ -749,19 +886,23 @@ class WebApp:
         url = str(payload.get("url") or "")
         if not url:
             raise MediaFansError("缺少 url")
+        nd = classify_netdisk(url)
+        if nd not in self.SUPPORTED_NETDISKS:
+            raise MediaFansError("不是有效的夸克/百度分享链接")
+        drive = self._drive_for(nd)
         code = str(payload.get("code") or "")
         wanted = {str(x) for x in (payload.get("fids") or [])}
-        to_dir = str(payload.get("to") or "").strip() or self.drive.save_dir
-        ctx = self.drive.open_share(url, passcode=code)
+        to_dir = str(payload.get("to") or "").strip() or drive.save_dir
+        ctx = drive.open_share(url, passcode=code)
         # share_fid_token 只在「列出该层」时才拿得到，所以必须列用户当前所在的那一层，
         # 否则从子目录里勾选的文件会因为找不到 token 而转存失败
-        files = self.drive.list_share_files(ctx, str(payload.get("dir_fid") or "0"))
+        files = drive.list_share_files(ctx, str(payload.get("dir_fid") or "0"))
         if wanted:
             files = [f for f in files if f.fid in wanted]
         if not files:
             raise MediaFansError("没有可转存的文件")
-        saved = self.drive.save_share_files(ctx, files, to_dir)
-        return {"saved": len(saved), "dir": norm_path(to_dir)}
+        saved = drive.save_share_files(ctx, files, to_dir)
+        return {"saved": len(saved), "dir": norm_path(to_dir), "netdisk": nd}
 
     # ------------------------------------------------------------------ http
     def _make_handler(self):
@@ -814,6 +955,8 @@ class WebApp:
                         self._json(200, app.api_season_fetch(self._body()))
                     elif parsed.path == "/api/episode/fetch":
                         self._json(200, app.api_episode_fetch(self._body()))
+                    elif parsed.path == "/api/login/baidu":
+                        self._json(200, app.api_login_baidu(self._body()))
                     elif parsed.path == "/api/auto":
                         length = int(self.headers.get("Content-Length") or 0)
                         raw = self.rfile.read(length) if length else b"{}"
@@ -921,19 +1064,22 @@ class WebApp:
                         self._send(200, PAGE_HTML.encode("utf-8"),
                                    "text/html; charset=utf-8", extra)
                     elif parsed.path == "/api/list":
-                        self._json(200, app.api_list(query.get("path", "")))
+                        self._json(200, app.api_list(query.get("path", ""),
+                                                     query.get("nd", "quark")))
                     elif parsed.path == "/api/play":
                         if not query.get("path"):
                             raise MediaFansError("缺少 path 参数")
-                        self._json(200, app.api_play(query["path"]))
+                        self._json(200, app.api_play(query["path"],
+                                                     query.get("nd", "quark")))
                     elif parsed.path == "/api/series":
                         self._json(200, app.api_series(
                             query.get("tmdb_id", 0), query.get("season", 1),
-                            query.get("refresh") == "1"))
+                            query.get("refresh") == "1", query.get("nd", "quark")))
                     elif parsed.path == "/api/watch/recent":
                         self._json(200, app.api_watch_recent(query.get("limit", 12)))
                     elif parsed.path == "/api/watch":
-                        self._json(200, app.api_watch_get(query.get("path", "")))
+                        self._json(200, app.api_watch_get(query.get("path", ""),
+                                                          query.get("nd", "quark")))
                     elif parsed.path == "/api/search/media":
                         self._json(200, app.api_search_media(query.get("kw", "")))
                     elif parsed.path == "/api/discover":
@@ -942,6 +1088,8 @@ class WebApp:
                         self._json(200, app.api_auto_status(query.get("job", "")))
                     elif parsed.path == "/api/login/poll":
                         self._json(200, app.api_login_poll(query.get("sid", "")))
+                    elif parsed.path == "/api/login/baidu":
+                        self._json(200, app.api_login_baidu())
                     elif parsed.path == "/api/search":
                         self._json(200, app.api_search(query.get("kw", ""),
                                                        query.get("netdisk", "")))
@@ -1023,6 +1171,7 @@ PAGE_HTML = r"""<!doctype html>
   .badge { flex:none; font-size:11px; padding:1px 8px; border-radius:4px;
            background:#23304d; color:#7fb0ff; }
   .b-quark { background:#204a33; color:#69d693; }
+  .b-baidu { background:#233a8f; color:#8fa7ff; }
   .ok { color:var(--ok); }
   .dim { color:var(--dim); }
   .ellipsis { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -1046,27 +1195,53 @@ PAGE_HTML = r"""<!doctype html>
   #player { flex:1; display:flex; flex-direction:column; padding:14px; min-width:0; }
   /* 播放区和控制条一起进全屏，否则全屏后就没控制条可用了 */
   #stage { position:relative; flex:1; min-height:0; display:flex; flex-direction:column;
-           background:#000; border-radius:8px; overflow:hidden; }
+           background:#000; border-radius:8px; overflow:hidden;
+           /* 竖滑要用来调亮度/音量，不能被页面滚动抢走 */
+           touch-action:none; }
   #stage:fullscreen { border-radius:0; }
   /* 拿不到真全屏权限时的兜底：把播放区铺满整个窗口 */
   body.theater > header, body.theater #browser { display:none; }
   body.theater #player { padding:0; }
   body.theater #stage { border-radius:0; }
-  #video { width:100%; flex:1; min-height:0; background:#000; outline:none; }
-  #ctrl { display:flex; align-items:center; gap:10px; padding:6px 10px; flex:none;
-          background:#12151c; border-top:1px solid var(--line); font-size:12px;
-          color:var(--dim); user-select:none; }
+  #video { width:100%; height:100%; flex:1; min-height:0; background:#000; outline:none;
+           /* 亮度手势调的是画面本身——浏览器没有调系统背光的 API */
+           transition:filter .1s linear; }
+  /* 控制条悬浮在画面上，不占高度。原来它是流式布局的一员，
+     全屏时会把画面往上挤出一条黑边，等于永久遮挡。 */
+  #ctrl { position:absolute; left:0; right:0; bottom:0; z-index:3;
+          display:flex; align-items:center; gap:10px; padding:10px 12px 8px;
+          background:linear-gradient(to top, rgba(0,0,0,.82) 0%,
+                     rgba(0,0,0,.55) 55%, rgba(0,0,0,0) 100%);
+          font-size:12px; color:#cfd6e4; user-select:none;
+          opacity:1; transition:opacity .25s, transform .25s; }
+  /* 播放中一段时间没动作就隐去，点一下画面再出来 */
+  #stage.idle #ctrl { opacity:0; transform:translateY(8px); pointer-events:none; }
+  #stage.idle { cursor:none; }
+  #ctrl button { color:#fff; text-shadow:0 1px 3px rgba(0,0,0,.6); }
+  #ctrl .time { text-shadow:0 1px 3px rgba(0,0,0,.6); }
+
+  /* 手势反馈：调亮度/音量时中间浮一个数值 */
+  #hud { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
+         z-index:4; background:rgba(0,0,0,.72); color:#fff; border-radius:10px;
+         padding:12px 18px; font-size:15px; letter-spacing:.5px; pointer-events:none;
+         opacity:0; transition:opacity .15s; white-space:nowrap; }
+  #hud.on { opacity:1; }
+  #hud .bar { height:4px; background:rgba(255,255,255,.28); border-radius:2px;
+              margin-top:8px; width:132px; }
+  #hud .bar i { display:block; height:100%; background:var(--accent); border-radius:2px; }
   #ctrl button { background:none; border:none; color:var(--text); padding:2px 4px;
                  font-size:15px; line-height:1; }
+  #ctrl select { background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.25);
+                 color:#fff; }
   #ctrl button:hover { color:var(--accent); }
   #ctrl .time { font-variant-numeric:tabular-nums; white-space:nowrap; }
   #trackWrap { flex:1; height:16px; display:flex; align-items:center; cursor:pointer;
                touch-action:none; }
-  #track { position:relative; width:100%; height:5px; background:#333a49; border-radius:3px;
-           transition:height .12s; }
+  #track { position:relative; width:100%; height:5px; background:rgba(255,255,255,.3);
+           border-radius:3px; transition:height .12s; }
   #trackWrap:hover #track, #trackWrap.dragging #track { height:8px; }
   #buf, #prog { position:absolute; left:0; top:0; bottom:0; border-radius:3px; }
-  #buf { background:#3d4557; }
+  #buf { background:rgba(255,255,255,.45); }
   #prog { background:var(--accent); }
   #knob { position:absolute; top:50%; width:12px; height:12px; margin:-6px 0 0 -6px;
           background:#fff; border-radius:50%; opacity:0; transition:opacity .12s; }
@@ -1155,6 +1330,16 @@ PAGE_HTML = r"""<!doctype html>
   #discoverBar .seg { flex:1; background:#222836; color:var(--dim); border:1px solid var(--line);
                       border-radius:6px; padding:6px 0; font-size:12px; }
   #discoverBar .seg.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  /* 凭据过期的提示条：错误本身没法自愈，得让人一键去重登 */
+  #authBar { display:none; align-items:center; gap:10px; padding:8px 12px;
+             background:#3a2a16; border-bottom:1px solid #5a4020; font-size:12px;
+             color:#e8c98a; flex:none; }
+  #authBar.on { display:flex; }
+  #authBar .grow { flex:1; }
+  #authBar button { background:var(--accent); color:#fff; border:none;
+                    border-radius:4px; padding:4px 12px; font-size:12px; }
+  #authBar .x { background:none; color:var(--dim); padding:2px 6px; }
+
   /* 华语和其他语种之间的分隔说明，占满整行 */
   .wall-note { grid-column:1/-1; color:var(--dim); font-size:11px; padding:6px 2px 2px;
                border-top:1px solid var(--line); margin-top:4px; }
@@ -1215,6 +1400,9 @@ PAGE_HTML = r"""<!doctype html>
           background:#2b3140; color:var(--dim); }
   #loginBtn { background:#222836; border:1px solid var(--line); color:var(--dim); flex:none; }
   #loginBtn:hover { color:var(--text); }
+  #driveSel { background:#222836; border:1px solid var(--line); color:var(--dim);
+              flex:none; border-radius:6px; padding:5px 6px; font:inherit; }
+  #driveSel:hover { color:var(--text); }
   #mask { position:fixed; inset:0; background:rgba(0,0,0,.66); display:none;
           align-items:center; justify-content:center; z-index:9; }
   #mask.on { display:flex; }
@@ -1341,6 +1529,10 @@ PAGE_HTML = r"""<!doctype html>
     <button onclick="searchMedia()">搜索</button>
   </div>
   <button id="loginBtn" onclick="openLogin()">登录</button>
+  <select id="driveSel" title="当前网盘：我的网盘 / 剧集 / 一键找片都作用于此盘" onchange="setDrive(this.value)">
+    <option value="quark">夸克</option>
+    <option value="baidu">百度</option>
+  </select>
 </header>
 <div id="autoPanel">
   <div id="autoBox">
@@ -1359,11 +1551,15 @@ PAGE_HTML = r"""<!doctype html>
 </div>
 <div id="mask" onclick="if(event.target===this)closeLogin()">
   <div id="loginBox">
-    <h2>扫码登录夸克</h2>
-    <div class="dim" style="font-size:12px">两种凭据各存各的，互不影响</div>
+    <h2>登录网盘</h2>
+    <div class="dim" style="font-size:12px">夸克、百度都可以扫码</div>
     <div class="pick">
-      <button onclick="startLogin('quark')">网页版扫码</button>
-      <button onclick="startLogin('tv')">TV 版扫码</button>
+      <button onclick="startLogin('quark')">夸克·网页版扫码</button>
+      <button onclick="startLogin('tv')">夸克·TV 版扫码</button>
+    </div>
+    <div class="pick">
+      <button onclick="startLogin('baidu')">百度·扫码登录</button>
+      <button onclick="showBaiduLogin()">百度·粘贴 cookie</button>
     </div>
     <div class="dim" style="font-size:11px;text-align:left">
       网页版存 cookie（现在浏览器播放用的就是它）；TV 版存 access_token，
@@ -1373,6 +1569,7 @@ PAGE_HTML = r"""<!doctype html>
       ⚠ TV 版的 code 换 token 这一步会经过第三方中转 api.extscreen.com（已强制 https）。
       换回来的 refresh_token 等于网盘的长期访问权，介意就别用这条路。
     </div>
+    <div id="baiduLogin" style="display:none;text-align:left"></div>
     <div id="qrWrap"></div>
     <div id="loginMsg"></div>
     <button class="linkbtn" onclick="closeLogin()">关闭</button>
@@ -1380,6 +1577,11 @@ PAGE_HTML = r"""<!doctype html>
 </div>
 <main>
   <section id="browser">
+    <div id="authBar">
+      <span class="grow" id="authMsg"></span>
+      <button id="authBtn" onclick="reloginFromBar()">重新扫码登录</button>
+      <button class="x" onclick="hideAuthBar()">×</button>
+    </div>
     <nav id="tabs">
       <button class="tab active" id="tabbtn-shows" onclick="switchTab('shows')">追剧</button>
       <button class="tab" id="tabbtn-series" onclick="switchTab('series')">剧集</button>
@@ -1424,12 +1626,13 @@ PAGE_HTML = r"""<!doctype html>
                onkeydown="if(event.key==='Enter')doSearch()">
         <select id="nd">
           <option value="quark">夸克</option>
+          <option value="baidu">百度</option>
           <option value="">全部</option>
         </select>
         <button onclick="doSearch()">搜</button>
       </div>
       <div class="pastebar">
-        <input id="pasteUrl" placeholder="或直接粘贴夸克分享链接" spellcheck="false">
+        <input id="pasteUrl" placeholder="或直接粘贴夸克/百度分享链接" spellcheck="false">
         <button onclick="openShare(document.getElementById('pasteUrl').value.trim(), '')">查看</button>
       </div>
       <div id="resultsWrap">
@@ -1450,7 +1653,7 @@ PAGE_HTML = r"""<!doctype html>
         <div id="shareFiles"></div>
         <div class="savebar">
           <span>目标目录</span>
-          <input id="toDir" value="/MediaFans" spellcheck="false">
+          <input id="toDir" value="" placeholder="/MediaFans（留空用默认目录）" spellcheck="false">
           <label class="chk"><input type="checkbox" id="selAll" checked
                  onchange="toggleAll(this.checked)"> 全选</label>
           <button id="saveBtn" onclick="saveShare()">转存选中</button>
@@ -1472,6 +1675,7 @@ PAGE_HTML = r"""<!doctype html>
   <section id="player">
     <div id="stage">
       <video id="video" preload="auto" playsinline></video>
+      <div id="hud"></div>
       <div id="ctrl">
         <button id="playBtn" onclick="togglePlay()" title="播放/暂停（空格）">▶</button>
         <span class="time" id="tCur">0:00</span>
@@ -1518,6 +1722,65 @@ let curFiles = [];    // 当前目录的全部条目
 let playlist = [];    // 其中可播放的，用来做上一个/下一个和连播
 let playIdx = -1;
 
+// 当前操作盘：顶栏下拉，作用于「我的网盘 / 剧集 / 一键找片」。
+// 搜资源页转存到哪个盘由分享链接本身决定（百度分享只能进百度盘），跟这里无关。
+let curNd = 'quark';
+let curPlayNd = 'quark';   // 正在播的这个文件属于哪个盘（记进度用）
+
+function setDriveValue(nd) {
+  curNd = nd || 'quark';
+  const sel = $('#driveSel');
+  if (sel) sel.value = curNd;
+}
+
+function setDrive(nd) {
+  if (nd === curNd) return;
+  setDriveValue(nd);
+  // 已打开的页面跟着切过去
+  if (series && series.data) loadSeason(series.tmdb_id, series.season, true);
+  else if (mineLoaded) loadDir($('#pathInput').value || '');
+}
+
+// 凭据过期跟别的错不一样：它不会自己好，用户必须去重登一次。
+// 百度的网页登录态尤其短（实测二十来分钟），只丢一句错误在角落里，
+// 用户只会觉得「怎么又不好使了」。所以单独拎出来做成一条能点的提示。
+const AUTH_HINTS = ['重新扫码', '登录态', '未配置 cookie', '登录已过期', 'cookie 已过期'];
+let authBarNd = 'quark';
+
+function isAuthError(msg) {
+  const t = String(msg || '');
+  return AUTH_HINTS.some(h => t.includes(h));
+}
+
+function showAuthBar(msg, nd) {
+  authBarNd = nd || curNd || 'quark';
+  const label = authBarNd === 'baidu' ? '百度网盘' : '夸克网盘';
+  // 逐条错误常带着「哪个来源失败了」的前缀（分享标题），提示条只要后半句的原因
+  let why = String(msg || '登录态已过期');
+  const cut = why.lastIndexOf('：');
+  if (cut > 0 && cut < why.length - 4) why = why.slice(cut + 1);
+  $('#authMsg').textContent = label + '：' + why;
+  $('#authBtn').textContent = '重新扫码登录' + label.slice(0, 2);
+  $('#authBar').classList.add('on');
+}
+
+function hideAuthBar() { $('#authBar').classList.remove('on'); }
+
+function reloginFromBar() {
+  hideAuthBar();
+  openLogin();
+  startLogin(authBarNd);
+}
+
+// 报错的统一出口：凭据问题弹提示条，其余照原样交给调用方显示
+function reportError(msg, nd) {
+  if (isAuthError(msg)) {
+    showAuthBar(msg, nd);
+    return true;
+  }
+  return false;
+}
+
 function icon(f) {
   return { dir: '📁', video: '🎬', audio: '🎵', subtitle: '💬' }[f.kind] || '📄';
 }
@@ -1526,7 +1789,8 @@ async function loadDir(path) {
   mineLoaded = true;
   $('#files').innerHTML = '<div class="empty">加载中…</div>';
   try {
-    const r = await fetch('/api/list?path=' + encodeURIComponent(path || ''));
+    const r = await fetch('/api/list?path=' + encodeURIComponent(path || '')
+                          + '&nd=' + curNd);
     const data = await r.json();
     if (data.error) throw new Error(data.error);
     document.getElementById('pathInput').value = data.path;
@@ -1535,6 +1799,7 @@ async function loadDir(path) {
     renderFiles();
   } catch (e) {
     curFiles = [];
+    reportError(e.message, curNd);
     $('#files').innerHTML = '<div class="empty">加载失败：' + e.message + '</div>';
   }
 }
@@ -1581,7 +1846,8 @@ let playCtx = null;
 
 async function savePos(path, sec, dur) {
   if (!path || !dur) return;
-  const body = Object.assign({ path: path, position: sec, duration: dur },
+  const body = Object.assign({ path: path, position: sec, duration: dur,
+                               netdisk: curPlayNd },
                              playCtx && playCtx.path === path ? playCtx.meta : {});
   try {
     await fetch('/api/watch', { method: 'POST',
@@ -1591,7 +1857,8 @@ async function savePos(path, sec, dur) {
 
 async function resumePos(path) {
   try {
-    const d = await (await fetch('/api/watch?path=' + encodeURIComponent(path))).json();
+    const d = await (await fetch('/api/watch?path=' + encodeURIComponent(path)
+                                 + '&nd=' + curPlayNd)).json();
     return (d.mark && d.mark.resume_at) || 0;
   } catch (e) { return 0; }
 }
@@ -1718,10 +1985,12 @@ function renderCrumb(path) {
 async function playFile(f) {
   // 从目录/播放列表点开的是散片，把剧集上下文清掉，免得进度记到别的剧上
   if (!f.keepCtx) playCtx = null;
+  curPlayNd = f.nd || curNd;
   const hint = $('#hint');
   hint.className = ''; hint.textContent = '获取直链…';
   try {
-    const r = await fetch('/api/play?path=' + encodeURIComponent(f.path));
+    const r = await fetch('/api/play?path=' + encodeURIComponent(f.path)
+                          + '&nd=' + curPlayNd);
     const data = await r.json();
     if (data.error) throw new Error(data.error);
     $('#title').textContent = data.file_name;
@@ -1736,6 +2005,7 @@ async function playFile(f) {
     hint.textContent = describe(data, pick)
       + (at ? '　（从上次的 ' + fmtTime(at) + ' 继续）' : '');
   } catch (e) {
+    reportError(e.message, curPlayNd);
     hint.className = 'error';
     hint.textContent = '播放失败：' + e.message;
   }
@@ -1959,6 +2229,119 @@ function theater(on) {
   $('#fsBtn').textContent = on ? '⤢' : '⛶';
 }
 
+// ---------------- 控制条自动隐藏 ----------------
+// 悬浮控制条盖在画面上，不隐的话全屏时一直压着字幕。
+// 只在「正在播 + 没在操作控制条」时才隐——暂停着还自动消失会让人以为卡死了。
+const IDLE_MS = 3000;
+let idleTimer = null;
+
+function showCtrl(rearm = true) {
+  stage.classList.remove('idle');
+  clearTimeout(idleTimer);
+  if (rearm) armIdle();
+}
+
+function armIdle() {
+  clearTimeout(idleTimer);
+  if (video.paused || !video.src) return;
+  idleTimer = setTimeout(() => {
+    // 鼠标停在控制条上时不隐，不然想点的东西会跑掉
+    if (!ctrlHot && !video.paused) stage.classList.add('idle');
+  }, IDLE_MS);
+}
+
+let ctrlHot = false;
+$('#ctrl').addEventListener('pointerenter', () => { ctrlHot = true; showCtrl(false); });
+$('#ctrl').addEventListener('pointerleave', () => { ctrlHot = false; armIdle(); });
+video.addEventListener('play', armIdle);
+video.addEventListener('pause', () => showCtrl(false));
+stage.addEventListener('mousemove', () => showCtrl());
+
+// ---------------- 亮度 / 音量手势 ----------------
+// 左半屏上下滑调亮度，右半屏调音量（手机播放器的通用手势）。
+// 亮度改的是 video 的 CSS filter——**浏览器没有调系统背光的 API**，
+// 能做的只有把画面本身调暗/调亮，观感接近但不是真背光。
+const BRIGHT_MIN = 0.2, BRIGHT_MAX = 1.6;
+let bright = 1;
+try { bright = parseFloat(localStorage.getItem('mf_bright') || '1') || 1; } catch (e) {}
+
+function applyBright() {
+  bright = Math.max(BRIGHT_MIN, Math.min(BRIGHT_MAX, bright));
+  video.style.filter = bright === 1 ? '' : `brightness(${bright.toFixed(2)})`;
+  try { localStorage.setItem('mf_bright', String(bright)); } catch (e) {}
+}
+applyBright();
+
+let hudTimer = null;
+
+function showHud(icon, ratio, text) {
+  const h = $('#hud');
+  h.innerHTML = '';
+  h.appendChild(el('div', null, icon + '　' + text));
+  const bar = el('div', 'bar');
+  const fill = document.createElement('i');
+  fill.style.width = Math.round(Math.max(0, Math.min(1, ratio)) * 100) + '%';
+  bar.appendChild(fill);
+  h.appendChild(bar);
+  h.classList.add('on');
+  clearTimeout(hudTimer);
+  hudTimer = setTimeout(() => h.classList.remove('on'), 700);
+}
+
+// 手势状态。用 pointer 事件，触摸和鼠标一套代码。
+let g = null;
+const GESTURE_SLOP = 14;   // 超过这个位移才算「在滑」，否则当点击
+
+stage.addEventListener('pointerdown', e => {
+  if (e.target.closest('#ctrl')) return;      // 控制条自己有拖拽逻辑
+  if (!video.src) return;
+  const r = stage.getBoundingClientRect();
+  g = {
+    id: e.pointerId, x: e.clientX, y: e.clientY, h: r.height || 1,
+    side: (e.clientX - r.left) < r.width / 2 ? 'bright' : 'vol',
+    startBright: bright, startVol: video.muted ? 0 : video.volume,
+    moved: false,
+  };
+});
+
+stage.addEventListener('pointermove', e => {
+  if (!g || e.pointerId !== g.id) return;
+  const dy = g.y - e.clientY;                 // 上滑为正
+  if (!g.moved && Math.abs(dy) < GESTURE_SLOP) return;
+  if (!g.moved) {
+    g.moved = true;
+    showCtrl(false);                          // 开始调节时把控制条留住
+  }
+  e.preventDefault();
+  // 整屏高度对应满量程的 1.2 倍，滑起来不至于太灵敏
+  const frac = dy / (g.h * 1.2);
+  if (g.side === 'vol') {
+    const v = Math.max(0, Math.min(1, g.startVol + frac));
+    video.volume = v;
+    video.muted = v === 0;
+    syncVolume();
+    showHud(v === 0 ? '🔇' : (v > 0.5 ? '🔊' : '🔉'), v, Math.round(v * 100) + '%');
+  } else {
+    bright = g.startBright + frac * (BRIGHT_MAX - BRIGHT_MIN);
+    applyBright();
+    const ratio = (bright - BRIGHT_MIN) / (BRIGHT_MAX - BRIGHT_MIN);
+    showHud('☀', ratio, Math.round(bright * 100) + '%');
+  }
+});
+
+function endGesture(e) {
+  if (!g || (e && e.pointerId !== g.id)) return;
+  const wasMove = g.moved;
+  g = null;
+  if (wasMove) { armIdle(); return; }
+  // 没滑动 = 点了一下画面：控制条藏着就唤出来，露着就收起去
+  if (stage.classList.contains('idle')) showCtrl();
+  else if (!video.paused) stage.classList.add('idle');
+}
+
+stage.addEventListener('pointerup', endGesture);
+stage.addEventListener('pointercancel', endGesture);
+
 function toggleFullscreen() {
   if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
   if (document.body.classList.contains('theater')) { theater(false); return; }
@@ -2162,6 +2545,10 @@ function watchRow(m) {
       body: JSON.stringify({ path: m.path }) }).then(renderWatch);
   };
   row.appendChild(x);
+  // 百度的进度记录带 netdisk，回放时要去对应的盘
+  if (m.netdisk && m.netdisk !== 'quark') {
+    row.appendChild(el('span', 'badge b-' + m.netdisk, m.netdisk));
+  }
   row.onclick = () => resumeWatch(m);
   return row;
 }
@@ -2169,11 +2556,13 @@ function watchRow(m) {
 async function resumeWatch(m) {
   if (m.tmdb_id && m.season) {
     // 进剧集页：看完了就落到下一集，没看完就接着这一集
+    setDriveValue(m.netdisk || 'quark');
     await openSeriesAt(m, m.finished ? m.episode + 1 : m.episode);
     return;
   }
   switchTab('mine');
-  playFile({ path: m.path, name: m.name, size_h: m.size_h || '' });
+  playFile({ path: m.play_path || m.path, name: m.name, size_h: m.size_h || '',
+             nd: m.netdisk || 'quark' });
 }
 
 // ---------------- 搜索 / 分享 / 转存 ----------------
@@ -2332,6 +2721,7 @@ async function reloadShare(keepDir) {
     if (data.error) throw new Error(data.error);
     shareCtx.dir_fid = data.dir_fid;
     shareCtx.crumb = data.crumb || '';
+    shareCtx.nd = data.netdisk || 'quark';
     $('#shareUrlShow').textContent = shareCtx.url;
     renderShareCrumb(data);
     renderShareStats(data.counts);
@@ -2426,7 +2816,7 @@ async function saveShare() {
         code: $('#codeInput').value.trim(),
         dir_fid: shareCtx.dir_fid || '0',
         fids: fids,
-        to: $('#toDir').value.trim() || '/MediaFans'
+        to: $('#toDir').value.trim()
       })
     });
     const data = await resp.json();
@@ -2436,7 +2826,11 @@ async function saveShare() {
     st.append(`✓ 已转存 ${data.saved} 项到 ${data.dir} `, (() => {
       const b = document.createElement('button');
       b.textContent = '打开目录';
-      b.onclick = () => { loadDir(data.dir); switchTab('mine'); };
+      b.onclick = () => {
+        setDriveValue(data.netdisk || 'quark');
+        loadDir(data.dir);
+        switchTab('mine');
+      };
       return b;
     })());
   } catch (e) {
@@ -2528,7 +2922,8 @@ async function startAuto(item) {
       body: JSON.stringify({ name: item.title, tmdb_id: item.tmdb_id,
                              original: item.original || '',
                              animation: item.animation === undefined ? null : item.animation,
-                             media_type: item.media_type || 'tv', save: true })
+                             media_type: item.media_type || 'tv', save: true,
+                             netdisk: curNd })
     });
     const data = await r.json();
     if (data.error) throw new Error(data.error);
@@ -2573,6 +2968,7 @@ function pollAuto(job) {
 function finishAuto(data) {
   if (data.error) { addStep('error', data.error); $('#autoStat').textContent = ''; return; }
   const res = data.result || {};
+  if (res.netdisk) setDriveValue(res.netdisk);
   renderCandidates(res);
   if (res.ok) {
     autoDir = res.saved_dir || '';
@@ -2612,6 +3008,7 @@ function renderCandidates(res) {
 
 function openAutoResult() {
   closeAuto();
+  // 一键找片跑在哪个盘，目录就去哪个盘开
   if (autoDir) loadDir(autoDir);
   switchTab('mine');
 }
@@ -2660,13 +3057,14 @@ async function loadSeason(tmdbId, season, refresh) {
   series = { tmdb_id: tmdbId, season };
   $('#epList').innerHTML = '<div class="empty">读取中…</div>';
   try {
-    const qs = `tmdb_id=${tmdbId}&season=${season}` + (refresh ? '&refresh=1' : '');
+    const qs = `tmdb_id=${tmdbId}&season=${season}&nd=${curNd}` + (refresh ? '&refresh=1' : '');
     const d = await (await fetch('/api/series?' + qs)).json();
     if (d.error) throw new Error(d.error);
     series.data = d;
     renderSeasons(d);
     renderEpisodes(d);
   } catch (e) {
+    reportError(e.message, curNd);
     $('#epList').innerHTML = '<div class="empty">读取失败：' + e.message + '</div>';
   }
 }
@@ -2761,12 +3159,13 @@ async function fetchEpisode(d, ep, src, btn) {
     const r = await fetch('/api/episode/fetch', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tmdb_id: d.tmdb_id, season: d.season,
-                             episode: ep.episode, index: src.index })
+                             episode: ep.episode, index: src.index, netdisk: curNd })
     });
     const res = await r.json();
     if (res.error) throw new Error(res.error);
     await loadSeason(d.tmdb_id, d.season, true);
   } catch (e) {
+    reportError(e.message, curNd);
     btn.classList.remove('busy');
     btn.textContent = '失败';
     btn.title = e.message;
@@ -2801,7 +3200,8 @@ function fetchSeason() {
   clearInterval(seriesJobTimer);
   fetch('/api/season/fetch', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tmdb_id: series.tmdb_id, season: series.season })
+    body: JSON.stringify({ tmdb_id: series.tmdb_id, season: series.season,
+                           netdisk: curNd })
   }).then(r => r.json()).then(d => {
     if (d.error) throw new Error(d.error);
     let shown = 0;
@@ -2816,6 +3216,7 @@ function fetchSeason() {
       clearInterval(seriesJobTimer);
       btn.disabled = false;
       if (st.error) {
+        reportError(st.error, curNd);
         btn.textContent = '重试转存';
         $('#scanLog').appendChild(el('div', null, '✗ ' + st.error));
         return;
@@ -2830,6 +3231,11 @@ function fetchSeason() {
       if (b.failed && b.failed.length) bits.push(b.failed.length + ' 集失败');
       $('#scanLog').appendChild(el('div', null, '✓ ' + (bits.join('，') || '没有变化')));
       for (const e of (b.errors || [])) $('#scanLog').appendChild(el('div', null, '· ' + e));
+      // 批量转存里单个来源失败不会让整个任务 error，凭据过期就藏在这些
+      // 逐条错误里——不往上报的话，用户只看到「10 集失败」不知道该干嘛
+      for (const e of (b.errors || [])) {
+        if (reportError(e, curNd)) break;
+      }
       $('#scanLog').scrollTop = $('#scanLog').scrollHeight;
     }, 900);
   }).catch(e => {
@@ -2848,7 +3254,8 @@ function scanSources() {
   $('#scanLog').textContent = '';
   fetch('/api/series/scan', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ tmdb_id: series.tmdb_id, season: series.season })
+    body: JSON.stringify({ tmdb_id: series.tmdb_id, season: series.season,
+                           netdisk: curNd })
   }).then(r => r.json()).then(d => {
     if (d.error) throw new Error(d.error);
     let shown = 0;
@@ -2863,7 +3270,11 @@ function scanSources() {
       clearInterval(seriesJobTimer);
       btn.disabled = false;
       btn.textContent = '重新搜索';
-      if (st.error) { $('#scanLog').appendChild(el('div', null, '✗ ' + st.error)); return; }
+      if (st.error) {
+        reportError(st.error, curNd);
+        $('#scanLog').appendChild(el('div', null, '✗ ' + st.error));
+        return;
+      }
       series.data = st.result;
       renderSeasons(st.result);
       renderEpisodes(st.result);
@@ -2881,6 +3292,7 @@ function openLogin() {
   $('#mask').classList.add('on');
   $('#qrWrap').innerHTML = '';
   $('#tvWarn').style.display = 'none';
+  $('#baiduLogin').style.display = 'none';
   setLoginMsg('', '');
 }
 
@@ -2896,9 +3308,56 @@ function setLoginMsg(text, cls) {
   el.textContent = text;
 }
 
+// 百度没有可用的扫码通道：表单分两步——粘贴 cookie（分享/转存）、
+// 授权码换 token（列目录/直链）。两步独立，填一步存一步。
+async function showBaiduLogin() {
+  clearTimeout(loginTimer);
+  $('#tvWarn').style.display = 'none';
+  $('#qrWrap').innerHTML = '';
+  setLoginMsg('', '');
+  const box = $('#baiduLogin');
+  box.style.display = '';
+  box.innerHTML = '';
+  let has = false;
+  try {
+    const d = await (await fetch('/api/login/baidu')).json();
+    has = !!d.has_cookie;
+  } catch (e) {}
+  box.appendChild(el('div', 'dim',
+    '扫码失败时的备用通道。浏览器登录 pan.baidu.com → F12 → Network → '
+    + '任一请求的 Cookie 头整段复制（要含 BDUSS 和 STOKEN）'
+    + (has ? '　✓ 已保存过' : '')));
+  const input = document.createElement('textarea');
+  input.rows = 3;
+  input.style.width = '100%';
+  input.style.margin = '6px 0';
+  input.placeholder = 'BDUSS=...; STOKEN=...';
+  box.appendChild(input);
+  const btn = el('button', null, '保存 cookie');
+  btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const r = await fetch('/api/login/baidu', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cookie: input.value.trim() })
+      });
+      const d = await r.json();
+      if (d.error) throw new Error(d.error);
+      setLoginMsg('✓ ' + d.message, 'ok');
+      box.style.display = 'none';
+      loadDir(document.getElementById('pathInput').value);
+    } catch (e) {
+      setLoginMsg(e.message, 'error');
+    }
+    btn.disabled = false;
+  };
+  box.appendChild(btn);
+}
+
 async function startLogin(kind) {
   clearTimeout(loginTimer);
   $('#tvWarn').style.display = kind === 'tv' ? '' : 'none';
+  $('#baiduLogin').style.display = 'none';
   $('#qrWrap').innerHTML = '';
   setLoginMsg('正在获取二维码…', '');
   try {
@@ -2910,7 +3369,8 @@ async function startLogin(kind) {
     if (data.error) throw new Error(data.error);
     $('#qrWrap').innerHTML = '<img alt="扫码登录二维码">';
     $('#qrWrap img').src = data.qr;
-    setLoginMsg('请用夸克 APP 扫描（约 3 分钟内有效）', '');
+    setLoginMsg('请用' + (kind === 'baidu' ? '百度网盘' : '夸克')
+                + ' APP 扫描（约 3 分钟内有效）', '');
     pollLogin(data.sid);
   } catch (e) {
     setLoginMsg('获取二维码失败：' + e.message, 'error');
@@ -2922,11 +3382,17 @@ function pollLogin(sid) {
     try {
       const data = await (await fetch('/api/login/poll?sid=' + encodeURIComponent(sid))).json();
       if (data.error) throw new Error(data.error);
-      if (data.state === 'waiting') { pollLogin(sid); return; }
+      if (data.state === 'waiting') {
+        if (data.message) setLoginMsg(data.message, '');
+        pollLogin(sid);
+        return;
+      }
       if (data.state === 'failed') { setLoginMsg('登录失败：' + data.message, 'error'); return; }
       setLoginMsg('✓ ' + data.message, 'ok');
       $('#qrWrap').innerHTML = '';
-      if (data.kind === 'quark') loadDir(document.getElementById('pathInput').value);
+      if (data.kind === 'quark' || data.kind === 'baidu') {
+        loadDir(document.getElementById('pathInput').value);
+      }
     } catch (e) {
       setLoginMsg('轮询失败：' + e.message, 'error');
     }

@@ -6,6 +6,14 @@ quark.cookie
 watch.json
 quark_tv.json
 quark_tv_qrcode.png
+# 百度：扫码登录的 BDUSS+STOKEN、OAuth token
+baidu.cookie
+baidu.json
+# 兜底：任何 *.cookie / *_token.json 都别进仓库
+*.cookie
+*_token.json
+# 其它工具的工作目录
+.zcode/
 .venv/
 __pycache__/
 *.pyc

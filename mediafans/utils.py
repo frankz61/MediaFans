@@ -43,6 +43,10 @@ _NETDISK_ALIASES = {
 
 _QUARK_SHARE_RE = re.compile(r"pan\.quark\.cn/s/([A-Za-z0-9_-]+)")
 _QUARK_PASS_RE = re.compile(r"[?&]pwd=([A-Za-z0-9]{4})")
+# /s/1xxxx 的 surl 不含前缀 1；/share/init?surl=xxxx 本来就不带 1
+_BAIDU_S_RE = re.compile(r"pan\.baidu\.com/s/1([A-Za-z0-9_-]+)")
+_BAIDU_INIT_RE = re.compile(r"[?&]surl=([A-Za-z0-9_-]+)")
+_BAIDU_PASS_RE = re.compile(r"[?&]pwd=([A-Za-z0-9]{4})")
 
 
 def now_ms() -> int:
@@ -71,6 +75,23 @@ def parse_quark_share(url: str) -> Optional[tuple]:
     pwd_id = m.group(1)
     pm = _QUARK_PASS_RE.search(url)
     return pwd_id, (pm.group(1) if pm else "")
+
+
+def parse_baidu_share(url: str) -> Optional[tuple]:
+    """从百度分享链接提取 (surl, passcode, legacy)。
+
+    surl 不含前缀 1；旧式 uk/shareid 链接返回 ("", "", {"uk": .., "shareid": ..})。
+    """
+    u = url or ""
+    m = _BAIDU_S_RE.search(u) or _BAIDU_INIT_RE.search(u)
+    if m:
+        pm = _BAIDU_PASS_RE.search(u)
+        return m.group(1), (pm.group(1) if pm else ""), None
+    sid = re.search(r"[?&]shareid=(\d+)", u)
+    uk = re.search(r"[?&]uk=(\d+)", u)
+    if sid and uk:
+        return "", "", {"shareid": sid.group(1), "uk": uk.group(1)}
+    return None
 
 
 def json_path_get(obj: Any, path: str) -> Any:

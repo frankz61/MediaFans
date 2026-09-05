@@ -240,7 +240,10 @@ def index_sources(probes: List[ProbeResult], season: Optional[int],
             if season is not None and f.season is not None and f.season != season:
                 continue
             if w.known():
-                why = belongs(_share_path(pr, f), w, trust_titles=bool(trust))
+                # require_title：整条路径都没提本剧就不要。分享粒度的判断太松——
+                # 一个短剧合集里只要有一层带上剧名，整份分享的文件都会拿到资格。
+                why = belongs(_share_path(pr, f), w, trust_titles=bool(trust),
+                              require_title=bool(trust))
                 if why:
                     if dropped is not None:
                         dropped.append(f"{f.name[:40]}（{why}）")
@@ -275,6 +278,7 @@ def build_series(
     *,
     title: str = "",
     local_dir: str = "",
+    netdisk: str = "quark",
     probe_top: int = DEFAULT_PROBE_TOP,
     with_sources: bool = True,
     on_step: Optional[Callable[[str, dict], None]] = None,
@@ -327,12 +331,12 @@ def build_series(
     step("search", f"缺 {len(missing)} 集（{_fmt_eps(missing)}），"
                    f"用 {len(queries)} 种写法找来源：{'、'.join(queries)}")
     failures: List[str] = []
-    links = multi_search(search_fn, queries, "quark", failures=failures)
+    links = multi_search(search_fn, queries, netdisk, failures=failures)
     cands = links[:PROBE_CAP]
     if not cands:
         # 「搜索源挂了」和「真没这个资源」对用户是两件事，别混为一谈
         view.notes.append(f"搜索失败：{'；'.join(failures[:2])}" if len(failures) == len(queries)
-                          else "没搜到可用的夸克资源")
+                          else f"没搜到可用的{netdisk}资源")
         step("error", view.notes[-1])
         return view
     if failures:

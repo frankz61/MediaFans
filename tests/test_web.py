@@ -133,7 +133,7 @@ def make_webapp(upstream_url, search_fn=None):
 
     drive = QuarkDrive({"cookie": "__puus=x", "save_dir": "/MediaFans"},
                        transport=httpx.MockTransport(handler))
-    app = WebApp(lambda: drive, search_fn=search_fn)
+    app = WebApp(lambda nd="quark": drive, search_fn=search_fn)
     app.test_state = state
     app.start()
     return app
@@ -309,7 +309,7 @@ def test_api_share_and_save_selected(webapp):
     r = httpx.post(base + "/api/save", timeout=15,
                    json={"url": share, "code": "88ab", "fids": ["SF1"]})
     assert r.status_code == 200
-    assert r.json() == {"saved": 1, "dir": "/MediaFans"}
+    assert r.json() == {"saved": 1, "dir": "/MediaFans", "netdisk": "quark"}
     save_body = app.test_state["save"]
     assert save_body["fid_list"] == ["SF1"]
     assert save_body["fid_token_list"] == ["TK1"]
@@ -325,10 +325,10 @@ def test_api_share_and_save_selected(webapp):
     assert app.test_state["created_dir"] == "/MediaFans/新剧"
     assert app.test_state["save"]["fid_list"] == ["SF1", "SF2"]  # 不勾选 = 全部
 
-    # 非夸克链接
+    # 非网盘链接
     r = httpx.get(base + "/api/share", params={"url": "https://example.com/x"}, timeout=10)
     assert r.status_code == 400
-    assert "夸克分享" in r.json()["error"]
+    assert "分享链接" in r.json()["error"]
 
 
 # ---------------------------------------------------------------- 扫码登录
@@ -452,7 +452,7 @@ def _nested_share_app(upstream_url):
 
     drive = QuarkDrive({"cookie": "__puus=x", "save_dir": "/MediaFans"},
                        transport=httpx.MockTransport(handler))
-    app = WebApp(lambda: drive)
+    app = WebApp(lambda nd="quark": drive)
     app.test_state = state
     app.start()
     return app
@@ -810,7 +810,7 @@ def test_page_discards_stale_poster_wall_responses():
 def _watch_app(tmp_path):
     from mediafans.web import WebApp
 
-    return WebApp(lambda: None, watch_path=tmp_path / "watch.json")
+    return WebApp(lambda nd="quark": None, watch_path=tmp_path / "watch.json")
 
 
 def test_watch_roundtrip(tmp_path):
@@ -925,7 +925,7 @@ def test_season_fetch_needs_a_scanned_season(tmp_path):
     from mediafans.errors import MediaFansError
     from mediafans.web import WebApp
 
-    app = WebApp(lambda: None, watch_path=tmp_path / "w.json")
+    app = WebApp(lambda nd="quark": None, watch_path=tmp_path / "w.json")
     with pytest.raises(MediaFansError) as e:
         app.api_season_fetch({"tmdb_id": 1, "season": 1})
     assert "重新扫描" in str(e.value)
@@ -936,10 +936,10 @@ def test_season_fetch_refuses_when_there_is_nothing_to_get(tmp_path):
     from mediafans.errors import MediaFansError
     from mediafans.web import WebApp
 
-    app = WebApp(lambda: None, watch_path=tmp_path / "w.json")
+    app = WebApp(lambda nd="quark": None, watch_path=tmp_path / "w.json")
     row = EpisodeRow(episode=1, title="第1集")
     row.local = LocalFile(path="/d/E01.mkv", name="E01.mkv", size=1)
-    app.series_cache.put((1, 1), SeriesView(tmdb_id=1, title="剧", season=1,
+    app.series_cache.put(("quark", 1, 1), SeriesView(tmdb_id=1, title="剧", season=1,
                                             seasons=[], rows=[row]))
     with pytest.raises(MediaFansError) as e:
         app.api_season_fetch({"tmdb_id": 1, "season": 1})
@@ -953,3 +953,228 @@ def test_page_has_a_one_click_grab_button():
     assert 'id="grabBtn"' in PAGE_HTML and "function fetchSeason()" in PAGE_HTML
     # 没扫出来源时按了也没用，所以按可补集数决定显不显示
     assert "grab.style.display = c.available ? '' : 'none';" in PAGE_HTML
+
+
+# ---------------------------------------------------------------- 百度网盘全链路
+def test_baidu_share_save_play_stream(upstream_url, tmp_path):
+    from urllib.parse import parse_qs
+
+    from mediafans.drive.baidu import BaiduDrive
+
+    state = {}
+
+    def handler(request):
+        p = request.url.path
+        if p == "/share/wxlist":
+            state["wxlist"] = {k: v[0] for k, v in
+                               parse_qs(request.content.decode()).items()}
+            return httpx.Response(200, json={"errno": 0, "data": {
+                "shareid": 111, "uk": 222, "seckey": "SEK",
+                "list": [
+                    {"fs_id": 333, "server_filename": "movie.mkv", "isdir": 0,
+                     "size": 2048, "path": "/s/movie.mkv"},
+                ]}})
+        if p == "/api/gettemplatevariable":
+            return httpx.Response(200, json={"errno": 0, "result": {"bdstoken": "B"}})
+        if p == "/share/transfer":
+            state["transfer"] = {k: v[0] for k, v in
+                                 parse_qs(request.content.decode()).items()}
+            state["transfer_cookie"] = request.headers.get("cookie", "")
+            return httpx.Response(200, json={"errno": 0})
+        if p == "/api/list":
+            d = request.url.params.get("dir", "/")
+            if d == "/":
+                return httpx.Response(200, json={"errno": 0, "list": [
+                    {"fs_id": 9, "path": "/MediaFans",
+                     "server_filename": "MediaFans", "isdir": 1}]})
+            if d == "/MediaFans":
+                return httpx.Response(200, json={"errno": 0, "list": [
+                    {"fs_id": 333, "path": "/MediaFans/movie.mkv",
+                     "server_filename": "movie.mkv", "isdir": 0, "size": 2048}]})
+            return httpx.Response(200, json={"errno": 0, "list": []})
+        if p == "/api/create":
+            return httpx.Response(200, json={"errno": 0, "path": "/MediaFans"})
+        if p == "/api/filemetas":
+            return httpx.Response(200, json={"errno": 0, "info": [
+                {"fs_id": 333, "server_filename": "movie.mkv", "size": 2048,
+                 "dlink": "https://pan.baidu.com/dl/x?fid=333"}]})
+        if p == "/dl/x":
+            state["dlink_head"] = request.headers.get("user-agent")
+            return httpx.Response(302, headers={"Location": upstream_url})
+        raise AssertionError(f"unexpected {p}")
+
+    baidu = BaiduDrive({"cookie": "BDUSS=b; STOKEN=t",
+                        "save_dir": "/MediaFans"},
+                       transport=httpx.MockTransport(handler))
+    app = WebApp(lambda nd="quark": baidu if nd == "baidu" else None,
+                 watch_path=tmp_path / "watch.json")
+    app.start()
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        share = "https://pan.baidu.com/s/1BduLink?pwd=ab12"
+        # 打开分享：网盘自动识别 + 文件列表
+        r = httpx.get(base + "/api/share", params={"url": share, "code": "ab12"}, timeout=10)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["netdisk"] == "baidu"
+        assert [f["fid"] for f in body["files"]] == ["333"]
+        # 转存：sekey 以 BDCLND cookie 传给 transfer
+        r = httpx.post(base + "/api/save", json={"url": share, "code": "ab12",
+                                                 "fids": ["333"]}, timeout=10)
+        assert r.status_code == 200
+        assert r.json()["netdisk"] == "baidu"
+        assert state["transfer"]["fsidlist"] == "[333]"
+        assert "BDCLND=SEK" in state["transfer_cookie"]
+        # 列百度盘目录
+        r = httpx.get(base + "/api/list", params={"path": "/MediaFans", "nd": "baidu"}, timeout=10)
+        assert r.status_code == 200
+        assert [f["name"] for f in r.json()["files"]] == ["movie.mkv"]
+        # 播放：直链带 UA 要求，走本地 /stream 中继
+        r = httpx.get(base + "/api/play",
+                      params={"path": "/MediaFans/movie.mkv", "nd": "baidu"}, timeout=10)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["netdisk"] == "baidu"
+        assert not data["direct"]
+        assert data["stream_url"].startswith("/stream?t=")
+        rr = httpx.get(base + data["stream_url"],
+                       headers={"Range": "bytes=0-99"}, timeout=10)
+        assert rr.status_code == 206
+        assert rr.content == UPSTREAM_DATA[:100]
+        assert state["dlink_head"] == "pan.baidu.com"
+        # 进度：百度记录带网盘前缀，最近观看解析出 netdisk
+        r = httpx.post(base + "/api/watch", json={
+            "path": "/MediaFans/movie.mkv", "netdisk": "baidu",
+            "position": 600, "duration": 2700}, timeout=10)
+        assert r.status_code == 200
+        r = httpx.get(base + "/api/watch/recent", timeout=10)
+        item = r.json()["items"][0]
+        assert item["path"] == "baidu:/MediaFans/movie.mkv"
+        assert item["netdisk"] == "baidu"
+        assert item["play_path"] == "/MediaFans/movie.mkv"
+    finally:
+        app.stop()
+
+
+def test_expired_credentials_get_a_clickable_relogin_bar():
+    """凭据过期跟别的错不一样：它不会自己好，用户必须去重登一次。
+
+    百度的网页登录态尤其短（实测二十来分钟），只在角落里丢一句错误，
+    用户只会觉得「怎么又不好使了」。
+    """
+    from mediafans.web import PAGE_HTML
+
+    assert 'id="authBar"' in PAGE_HTML and "function reloginFromBar()" in PAGE_HTML
+    # 提示条要能带着「是哪个盘」去开对应的扫码
+    assert "startLogin(authBarNd)" in PAGE_HTML
+    # 关键的几条出错路径都要接上
+    assert PAGE_HTML.count("reportError(") >= 7
+    # 批量转存里单个来源失败不会让任务整体 error，凭据过期藏在逐条错误里，
+    # 不检查的话用户只看到「10 集失败」，正是最该提示的场景
+    assert "for (const e of (b.errors || [])) {" in PAGE_HTML
+
+
+def test_baidu_paste_login_normalises_the_cookie(tmp_path):
+    """粘贴来的 cookie 也要去掉 *_BFESS 重复键，跟扫码存的形态保持一致."""
+    from mediafans.web import WebApp
+
+    app = WebApp(lambda nd=None: None,
+                 cookie_paths={"baidu": tmp_path / "baidu.cookie"},
+                 watch_path=tmp_path / "w.json")
+    app.api_login_baidu({"cookie": "BDUSS=a; BDUSS_BFESS=a2; STOKEN=s; STOKEN_BFESS=s2"})
+    saved = (tmp_path / "baidu.cookie").read_text(encoding="utf-8")
+    assert saved == "BDUSS=a; STOKEN=s"
+
+
+def test_baidu_paste_login_warns_about_missing_stoken(tmp_path):
+    from mediafans.web import WebApp
+
+    app = WebApp(lambda nd=None: None,
+                 cookie_paths={"baidu": tmp_path / "baidu.cookie"},
+                 watch_path=tmp_path / "w.json")
+    d = app.api_login_baidu({"cookie": "BDUSS=a"})
+    assert "转存会失败" in d["message"]
+
+
+def test_auth_bar_strips_the_source_prefix():
+    """逐条错误带「哪个来源失败了」的前缀，提示条只要原因那半句."""
+    from mediafans.web import PAGE_HTML
+
+    assert "const cut = why.lastIndexOf('：');" in PAGE_HTML
+
+
+def test_tv_failure_is_not_permanent(tmp_path, monkeypatch):
+    """TV 挂过一次就永久走代理，是「有时候卡、重启就好」的根源。
+
+    实测两条路差得很远：TV 直链浏览器直连 CDN 5-7 MB/s，退回代理经服务器中转
+    只有 0.85 MB/s 还带秒级停顿。一次网络抖动把之后所有播放永久钉在慢路上，
+    这种粘性降级最难查，所以失败要有冷却期。
+    """
+    import time as _t
+
+    from mediafans.web import WebApp
+
+    tok = tmp_path / "quark_tv.json"
+    tok.write_text("{}", encoding="utf-8")
+    app = WebApp(lambda nd=None: None, tv_token_path=tok,
+                 watch_path=tmp_path / "w.json")
+
+    built = []
+
+    class FakeTV:
+        def __init__(self, path):
+            built.append(1)
+
+    monkeypatch.setattr("mediafans.drive.quark_tv.QuarkTVClient", FakeTV)
+    assert app.tv is not None and len(built) == 1
+
+    # 模拟一次瞬时失败
+    app._tv_failed = "网络抖了一下"
+    app._tv_failed_at = _t.time()
+    assert app.tv is None, "冷却期内应该走代理"
+
+    # 冷却期过了要自己再试，不该等重启
+    app._tv_failed_at = _t.time() - app.TV_RETRY_AFTER - 1
+    assert app.tv is not None, "冷却结束后应该重新尝试 TV 直链"
+    assert len(built) == 2
+
+
+# ---------------------------------------------------------------- 播放器 UI
+def test_controls_float_over_the_video():
+    """控制条原来是流式布局的一员，会把画面往上挤出一条黑边——全屏时等于永久遮挡."""
+    from mediafans.web import PAGE_HTML
+
+    assert "#ctrl { position:absolute; left:0; right:0; bottom:0;" in PAGE_HTML
+    # 悬浮之后进度条要能压住画面，不能再用不透明底色
+    assert "background:rgba(255,255,255,.3)" in PAGE_HTML
+
+
+def test_controls_auto_hide_only_while_playing():
+    """暂停着还自动消失会让人以为卡死了."""
+    from mediafans.web import PAGE_HTML
+
+    assert "#stage.idle #ctrl { opacity:0;" in PAGE_HTML
+    assert "if (video.paused || !video.src) return;" in PAGE_HTML
+    # 鼠标停在控制条上时不隐，不然想点的东西会跑掉
+    assert "if (!ctrlHot && !video.paused)" in PAGE_HTML
+
+
+def test_tap_toggles_the_controls():
+    from mediafans.web import PAGE_HTML
+
+    assert "if (stage.classList.contains('idle')) showCtrl();" in PAGE_HTML
+
+
+def test_vertical_swipe_adjusts_brightness_and_volume():
+    """左半屏调亮度、右半屏调音量，是手机播放器的通用手势。
+
+    亮度改的是 video 的 CSS filter——浏览器没有调系统背光的 API。
+    """
+    from mediafans.web import PAGE_HTML
+
+    assert "e.clientX - r.left) < r.width / 2 ? 'bright' : 'vol'" in PAGE_HTML
+    assert "brightness(${bright.toFixed(2)})" in PAGE_HTML
+    # 竖滑要用来调节，不能被页面滚动抢走
+    assert "touch-action:none; }" in PAGE_HTML
+    # 小位移算点击，不算滑动，否则点一下就把音量改了
+    assert "GESTURE_SLOP" in PAGE_HTML

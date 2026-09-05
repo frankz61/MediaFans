@@ -64,6 +64,22 @@ drive:
     # 转存目标目录（不存在会自动创建）
     save_dir: "/MediaFans"
 
+  baidu:
+    # 百度网盘（可选，建议 SVIP 账号：非会员直链限速看不动视频）。凭据分两套：
+    #
+    # ① cookie —— 打开分享 / 转存用（低频）。浏览器登录 pan.baidu.com 后 F12 ->
+    #    Network -> 任一请求的 Cookie 头，必须同时包含 BDUSS 和 STOKEN（转存要 STOKEN）。
+    #    推荐 mediafans login --netdisk baidu 粘贴保存，也可以配 token_provider 中转站。
+    cookie: ""
+    # ② OAuth —— 列目录 / 取直链用（官方稳定通道）。到 pan.baidu.com/union 免费注册
+    #    个人应用拿 AppKey/SecretKey 填到下面，然后运行 mediafans login --netdisk baidu
+    #    完成一次授权。refresh_token 只需首次填写，之后自动轮换保存在 baidu.json。
+    app_key: ""
+    secret_key: ""
+    refresh_token: ""
+    # 转存目标目录（不存在会自动创建）
+    save_dir: "/MediaFans"
+
 ai:
   # 可选。配了就用 Claude 复核「哪个资源才是你要的剧」，处理别名、合集混装、
   # 季号写法混乱这类规则搞不定的情况。不配也能用——资源验证和排序都是确定性的，
@@ -129,16 +145,22 @@ def discover_config_path(explicit: Optional[str] = None) -> Optional[Path]:
     return None
 
 
-def cookie_file_for(cfg: Config) -> Path:
-    """扫码登录的 cookie 缓存文件位置（与配置文件同目录，便于一起管理）."""
+def cookie_file_for(cfg: Config, netdisk: str = "quark") -> Path:
+    """登录凭据 cookie 缓存文件位置（与配置文件同目录，便于一起管理）."""
     base = cfg.path.parent if cfg.path else (Path.home() / ".mediafans")
-    return base / "quark.cookie"
+    return base / f"{netdisk}.cookie"
 
 
 def tv_token_file_for(cfg: Config) -> Path:
     """TV 版扫码登录的 token 缓存（含 device_id，refresh 时要用同一个）."""
     base = cfg.path.parent if cfg.path else (Path.home() / ".mediafans")
     return base / "quark_tv.json"
+
+
+def baidu_token_file_for(cfg: Config) -> Path:
+    """百度 OAuth token 缓存（refresh_token 每次刷新都会轮换，必须落盘）."""
+    base = cfg.path.parent if cfg.path else (Path.home() / ".mediafans")
+    return base / "baidu.json"
 
 
 def watch_file_for(cfg: Config) -> Path:

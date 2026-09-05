@@ -46,7 +46,7 @@ class AutoResult:
 
 
 def _prefilter(links: List[ShareLink], netdisk: str, limit: int) -> List[ShareLink]:
-    """探测前先按能不能用筛一遍：只有夸克能转存，重复链接去掉。"""
+    """探测前先按能不能用筛一遍：只要能转存的网盘（夸克/百度），重复链接去掉。"""
     seen, out = set(), []
     for l in links:
         if netdisk and l.netdisk != netdisk:

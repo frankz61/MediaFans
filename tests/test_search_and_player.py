@@ -33,7 +33,20 @@ def test_aggregate_dedup_and_error_tolerance():
     assert errors and errors[0][0] == "c"
     quark_urls = [l.url for l in links if l.netdisk == "quark"]
     assert len(quark_urls) == 1  # 去重（忽略 query）
-    assert links[0].netdisk == "quark"  # 夸克排前面
+    assert links[0].netdisk == "quark"  # 可转存网盘（夸克/百度）排前面
+
+
+def test_aggregate_transferable_first():
+    links, _ = aggregate_search(
+        [FakeProvider("a", results=[
+            ShareLink(url="https://www.alipan.com/s/x", netdisk="aliyun"),
+            ShareLink(url="https://pan.baidu.com/s/1bcd?pwd=1111", netdisk="baidu"),
+            ShareLink(url="https://pan.quark.cn/s/q", netdisk="quark"),
+        ])],
+        "kw",
+    )
+    assert [l.netdisk for l in links][:2] == ["quark", "baidu"]  # 可转存的在前
+    assert links[2].netdisk == "aliyun"  # 其他网盘垫底
 
 
 def test_pansou_provider_parses_merged():

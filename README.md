@@ -6,12 +6,12 @@
 后续可以原样包装成 MCP Server 交给任意 AI 客户端调用。
 
 ```
-mediafans login     →  夸克扫码登录（终端二维码，自动保存 cookie）
+mediafans login     →  登录网盘（夸克扫码 / 百度粘贴 cookie+OAuth）
 mediafans web       →  本地网页客户端：搜索/转存/浏览/播放一体（推荐，日常用这个）
 mediafans discover  →  TMDB 最近热门影视
 mediafans search    →  聚合搜索网盘分享链接（PanSou/易搜，多源并发）
 mediafans share     →  查看分享里的文件列表
-mediafans save      →  转存到自己的夸克网盘（自动建目录、任务轮询）
+mediafans save      →  转存到自己的网盘（自动建目录、任务轮询）
 mediafans ls / find →  浏览/查找自己网盘里的文件
 mediafans url / play → 实时生成直链（带 UA/Cookie 校验）/ 调外部播放器
 ```
@@ -32,6 +32,7 @@ python -m venv .venv
 # 1. 生成配置模板并填写
 mediafans config init                 # 写入 ~/.mediafans/config.yaml（或项目目录 config.yaml）
 mediafans login                       # 夸克扫码登录（终端显示二维码，APP 扫一下即可）
+mediafans login --netdisk baidu       # 百度：粘贴 cookie + OAuth 授权码（两步，见下）
 mediafans doctor                      # 体检：配置/账号/搜索源/播放器
 
 # 2. 全链路（推荐在网页里完成）
@@ -39,10 +40,10 @@ mediafans web                                    # 搜索 → 勾选转存 → �
 
 # 命令行同样可用
 mediafans discover --type tv -n 10                # 最近热门剧集（TMDB）
-mediafans search "流浪地球 4K" --netdisk quark     # 搜资源
-mediafans share "https://pan.quark.cn/s/xxxx"     # 看看分享里有什么
-mediafans save "https://pan.quark.cn/s/xxxx" --name "4K"   # 转存（可按文件名过滤）
-mediafans ls /MediaFans                           # 命令行浏览
+mediafans search "流浪地球 4K" --netdisk quark     # 搜资源（--netdisk baidu 搜百度盘）
+mediafans share "https://pan.quark.cn/s/xxxx"     # 看看分享里有什么（百度链接自动识别）
+mediafans save "https://pan.baidu.com/s/1xxxx?pwd=ab12"    # 转存（提取码带在链接里可省 --code）
+mediafans ls /MediaFans                           # 命令行浏览（--netdisk baidu 看百度盘）
 mediafans play 沙丘                               # 直链 + 调外部播放器（mpv/VLC…）
 ```
 
@@ -56,6 +57,16 @@ mediafans play 沙丘                               # 直链 + 调外部播放�
 | **TV 版扫码（实验）** | `mediafans login --tv`：走 TV 版 OAuth，存的是 access_token（`quark_tv.json`）而不是 cookie。**注意**：code 换 token 必须经第三方中转 `api.extscreen.com`（已强制 https），换回来的 refresh_token 等于网盘长期访问权，介意勿用。用 `mediafans tv-check <文件>` 验证 TV 直链是否免凭据 |
 | 静态 cookie | 浏览器登录 pan.quark.cn → F12 → Network → 任一请求的完整 Cookie 头，粘贴到 `drive.quark.cookie` |
 | token 中转站 | 配置 `drive.quark.token_provider`，每次运行实时拉取（见下） |
+
+百度网盘凭据两套（`mediafans login --netdisk baidu` 一次配齐，网页端「登录」弹窗也能配）：
+
+| 凭据 | 用途 | 获取方式 |
+|---|---|---|
+| cookie（BDUSS+STOKEN） | 打开分享 / 转存 | 浏览器登录 pan.baidu.com → F12 → Network → Cookie 头整段复制（存 `baidu.cookie`） |
+| OAuth refresh_token | 列目录 / 取直链（官方 xpan 接口，稳定通道） | [pan.baidu.com/union](https://pan.baidu.com/union) 免费注册个人应用拿 AppKey/SecretKey 填进 `drive.baidu`，授权一次即可；access_token 30 天自动续（存 `baidu.json`） |
+
+直链特点：SVIP 满速、8 小时有效、必须带 `User-Agent: pan.baidu.com`、支持 Range。
+浏览器 `<video>` 发不了自定义 UA，网页播放自动走本地 `/stream` 中继补头，无需配置。
 
 其他配置：
 
@@ -312,6 +323,60 @@ E01-E05 2160p / E06 掉到 1080p / E07 存了两份。而且 27 集意味着开 
 
 按目录分别判断：同一份分享可能一层是正片 `01…13`、另一层是花絮 `01…03`，
 混在一起判会互相干扰。
+
+### 百度网盘：为什么不走开放平台
+
+百度有官方开放平台（`pan.baidu.com/union`），**注册免费**，看起来是正路。实际走不通，
+三道墙都是硬的（文档：使用入门 → 权限与配额，2026-07-03 版）：
+
+> 第三方应用在网盘只能拥有一个文件夹用于存储、上传和下载文件，
+> **该文件夹必须位于 /apps 目录下**……对于权限外目录，应用不得
+> 查询目录或文件信息；读取、下载或**转存**文件内容。
+
+用户自己的 `/MediaFans` 属于「权限外目录」——列目录、取直链、转存全被明令禁止。
+另外未过审应用只有 **10 次/小时**的配额（列一个目录加取一次直链就烧掉好几次），
+而规范里又直接点名禁止「利用个人网盘账号……搭建网盘迁移工具」。
+
+所以百度这条线**全程走 cookie**（BDUSS + STOKEN），跟夸克一个路子。
+驱动里没有留 OAuth 代码——留着只会让下一个读代码的人再走一遍这条死路。
+
+**扫码登录**（`mediafans login --netdisk baidu`，或网页端「百度·扫码登录」）
+用的是 passport 的标准扫码通道，跟网页版扫码同一套。两个坑：
+
+- `channel/unicast` 是**长轮询**，没事件时挂住连接。第一次实测直接 15 秒读超时；
+  把超时当失败会让二维码立刻作废。改成 6 秒短超时问一次，超时即「还没动静」。
+- **STOKEN 要分两步领**：`qrbdusslogin` 只给 BDUSS，STOKEN 是访问网盘首页时才下发的。
+  少这一步转存必挂（errno -4），而且报错很难看懂，所以只拿到 BDUSS 时直接拦下说明原因。
+
+**几个实测出来的接口细节**，都不是看文档能知道的：
+
+| 现象 | 真相 |
+|---|---|
+| 转存报 errno 200025「提取码输入错误」 | 跟提取码无关。`wxlist` 返回的 seckey 把 base64 结尾的 `=` 写成了 `~`，还原后就好 |
+| `api/list` 对文件路径返回 errno 0 + 空列表 | 跟**空目录**长得一样。只有列表非空才能断定是目录，否则会把文件的 fid 变成路径字符串 |
+| 直链下载 403 | 必须带 `User-Agent: pan.baidu.com`。浏览器 UA 403，`netdisk` UA 在 CDN 上报 sign error(31362) |
+| 解 302 之后仍然 403 | **解 302 那一跳要带 cookie**，不带的话 Location 里的签名是坏的——而错误出现在后面的 CDN 上 |
+
+**登录态比 cookie 短命**：实测扫码后二十来分钟到两小时，`gettemplatevariable`
+（取 `bdstoken`，转存要用）就开始报 errno -6「用户未登录」，而同一份 cookie 的
+`api/list` 一直正常。所以**取直链刻意不带 bdstoken**（实测不需要）——
+这样浏览和播放能一直用，只有转存才需要重新扫码。过期时页面会弹一条
+可以直接点的「重新扫码登录」提示，而不是甩一个 errno 出来。
+
+### 播放器：悬浮控制条 + 手势
+
+控制条原来是播放区里的流式元素，会占掉一条高度把画面往上挤——全屏时那是一条
+**永久黑边**。改成绝对定位贴底 + 从下往上的渐变遮罩，画面占满整个播放区。
+进度条和缓冲条的底色也跟着换成半透明白，实色条压在画面上很脏。
+
+- **自动隐藏**：播放中 3 秒无操作隐去，点画面唤出、再点收起。两个边界——
+  暂停时不隐（不然会以为卡死），鼠标停在控制条上时不隐（不然想点的按钮会跑掉）。
+- **左右滑手势**：左半屏竖滑调亮度、右半屏调音量，中间浮出数值。位移小于 14px
+  算点击不算滑动，否则点一下就把音量改了。`#stage` 要 `touch-action:none`，
+  不然手机上竖滑会被页面滚动抢走。
+
+**亮度是画面亮度，不是屏幕背光**——浏览器没有调背光的 API，能做的只有对 video 加
+`filter: brightness()`。观感接近，但只影响视频区，环境光很强时不如真背光。
 
 ### 死链很多，所以分批探、够用就停
 

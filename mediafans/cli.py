@@ -11,13 +11,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 from . import __version__
-from .config import Config, cookie_file_for, init_config, load_config
+from .config import Config, baidu_token_file_for, cookie_file_for, init_config, load_config
 from .drive import create_drive
 from .errors import MediaFansError
 from .models import DriveFile, ShareLink
 from .player import detect_player, launch as launch_player
 from .search import aggregate_search, build_providers
-from .utils import classify_netdisk, fmt_size, norm_path, parse_quark_share, truncate
+from .utils import classify_netdisk, fmt_size, norm_path, truncate
 
 app = typer.Typer(
     help="MediaFans — 网盘搜索 / 转存 / 直链播放一体化 CLI",
@@ -35,10 +35,12 @@ def _cfg() -> Config:
     return load_config(_CONFIG_ARG)
 
 
-def _quark(cfg: Config):
-    section = dict(cfg.get("drive.quark") or {})
-    section.setdefault("cookie_file", str(cookie_file_for(cfg)))
-    return create_drive("quark", section)
+def _drive(cfg: Config, netdisk: str = "quark"):
+    section = dict(cfg.get(f"drive.{netdisk}") or {})
+    section.setdefault("cookie_file", str(cookie_file_for(cfg, netdisk)))
+    if netdisk == "baidu":
+        section.setdefault("token_file", str(baidu_token_file_for(cfg)))
+    return create_drive(netdisk, section)
 
 
 def _fail(e: Exception) -> None:
@@ -92,15 +94,19 @@ def config_cmd(
 # ============================================================ login
 @app.command()
 def login(
-    netdisk: str = typer.Option("quark", "--netdisk", help="当前支持 quark"),
+    netdisk: str = typer.Option("quark", "--netdisk", help="quark | baidu"),
     timeout: float = typer.Option(180, "--timeout", help="等待扫码的秒数"),
     tv: bool = typer.Option(False, "--tv", help="改用夸克 TV 版扫码，存 token 而不是 cookie"),
+    paste: bool = typer.Option(False, "--paste", help="改用粘贴浏览器 cookie（扫码失败时的备用）"),
 ):
-    """扫码登录网盘账号，cookie 自动保存到本地（推荐）."""
+    """登录网盘账号，凭据自动保存到本地（推荐）."""
     from .auth import QuarkQRLogin, render_qr_ascii
 
+    if netdisk.lower() == "baidu":
+        _login_baidu(timeout=timeout, paste=paste)
+        return
     if netdisk.lower() != "quark":
-        _fail(MediaFansError(f"暂不支持 {netdisk} 扫码登录（当前: quark）"))
+        _fail(MediaFansError(f"暂不支持 {netdisk} 登录（当前: quark | baidu）"))
     if tv:
         _login_tv(timeout)
         return
@@ -118,7 +124,7 @@ def login(
         cookie_path.parent.mkdir(parents=True, exist_ok=True)
         cookie_path.write_text(cookie, encoding="utf-8")
         try:
-            nickname = _quark(cfg).account_name()
+            nickname = _drive(cfg).account_name()
         except MediaFansError as e:
             nickname = ""  # cookie 已保存，昵称获取失败不阻断
             console.print(f"[yellow]! cookie 已保存，但账号校验未通过: {truncate(str(e), 100)}[/yellow]")
@@ -129,118 +135,55 @@ def login(
     console.print("[dim]下次直接使用即可；失效后重新 mediafans login 覆盖[/dim]")
 
 
-def _login_tv(timeout: float) -> None:
-    """TV 版扫码：二维码是 PNG 而不是 URL，终端里存成文件让用户打开扫。"""
-    import base64
-    import json as _json
+def _login_baidu(timeout: float = 180.0, paste: bool = False) -> None:
+    """百度扫码登录，拿 BDUSS + STOKEN。
 
-    from .auth import QuarkTVLogin
-    from .config import tv_token_file_for
+    不走开放平台 OAuth：官方 xpan 接口把第三方应用锁死在 /apps/{应用名}，
+    用户自己的目录属于「权限外目录」，查询和转存都被明令禁止，那条路对这个
+    项目走不通（见 README「为什么不走百度开放平台」）。
+    """
+    from .auth import BaiduQRLogin, render_qr_ascii
 
     cfg = _cfg()
-    token_path = tv_token_file_for(cfg)
-    device_id = ""
-    if token_path.exists():  # 复用旧 device_id，换绑设备会让 refresh 失效
-        try:
-            device_id = str(_json.loads(token_path.read_text(encoding="utf-8")).get("device_id") or "")
-        except (OSError, ValueError):
-            device_id = ""
+    cookie_path = cookie_file_for(cfg, "baidu")
 
-    console.print("[bold]夸克 TV 版扫码登录[/bold]")
-    console.print("[yellow]! code 换 token 这一步会经过第三方中转 api.extscreen.com（已强制 https）；"
-                  "换回来的 refresh_token 等于长期访问权，介意就别用这条路[/yellow]")
-    png_path = token_path.with_name("quark_tv_qrcode.png")
-
-    def _show(data_uri: str) -> None:
-        png_path.parent.mkdir(parents=True, exist_ok=True)
-        png_path.write_bytes(base64.b64decode(data_uri.split(",", 1)[1]))
-        console.print(f"二维码已保存: [cyan]{png_path}[/cyan] —— 打开它用夸克 APP 扫")
-
-    try:
-        flow = QuarkTVLogin(device_id=device_id)
-        token = flow.login(on_qr=_show,
-                           on_event=lambda m: console.print(f"[dim]{m}[/dim]"),
-                           poll_interval=2, timeout=timeout)
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(_json.dumps(token, ensure_ascii=False, indent=2), encoding="utf-8")
-    except MediaFansError as e:
-        _fail(e)
-    finally:
-        if png_path.exists():
-            png_path.unlink(missing_ok=True)
-    console.print(f"[green]✓ TV 登录成功[/green] token 已保存: {token_path}")
-    console.print("[dim]验证 TV 直链是否免 Cookie: mediafans tv-check[/dim]")
-
-
-# ============================================================ tv-check
-@app.command("tv-check")
-def tv_check(
-    target: str = typer.Argument(..., help="网盘里的文件路径或关键词"),
-):
-    """验证 TV 版直链到底要不要凭据 —— 这是 TV 登录唯一真正的价值所在。
-
-    PC 版直链必须带 Cookie（实测），所以浏览器只能走本地转发。
-    如果 TV 版直链裸请求就能 206，那 302 直连和 .strm 直连播放就都成立了。
-    """
-    import httpx
-
-    from .config import tv_token_file_for
-    from .drive.quark_tv import QUARK_TV_UA, QuarkTVClient
-
-    try:
-        cfg = _cfg()
-        tv = QuarkTVClient(tv_token_file_for(cfg))
-        try:
-            console.print(f"[dim]TV 账号: {tv.account_name() or '（未获取到昵称）'}[/dim]")
-        except MediaFansError as e:
-            # 昵称只是好看；取不到也要继续测直链，那才是这个命令的目的
-            from rich.markup import escape as _esc
-
-            console.print(f"[yellow]! 账号信息读取失败（不影响取直链）: "
-                          f"{_esc(truncate(str(e), 90))}[/yellow]")
-        # fid 用 PC 版解析（同一个网盘，fid 通用），省得再摸 TV 版的列目录接口
-        drive = _quark(cfg)
-        path, fid = _resolve_target(drive, target)
-        console.print(f"[dim]文件: {path}[/dim]")
-        with console.status("向 TV 接口取直链…"):
-            pt = tv.get_play_target(fid, name=path.rsplit("/", 1)[-1])
-    except MediaFansError as e:
-        _fail(e)
-
-    table = Table(title="TV 版直链：裸请求能不能过", show_lines=False)
-    table.add_column("档位", style="bold")
-    table.add_column("CDN 主机")
-    table.add_column("什么头都不带")
-    table.add_column("只带 UA")
-    ua = QUARK_TV_UA
-
-    def _probe(url: str, headers: dict) -> str:
-        try:
-            r = httpx.get(url, headers=dict(headers, Range="bytes=0-99"),
-                          timeout=25, follow_redirects=True)
-            return f"[green]{r.status_code}[/green]" if r.status_code in (200, 206)                 else f"[red]{r.status_code}[/red]"
-        except Exception as e:  # 网络问题也要看得见，不能吞
-            return f"[red]{type(e).__name__}[/red]"
-
-    naked_ok = True
-    for v in pt.variants:
-        host = httpx.URL(v.url).host
-        bare = _probe(v.url, {})
-        table.add_row(v.display(), host, bare, _probe(v.url, {"User-Agent": ua}))
-        if "green" not in bare:
-            naked_ok = False
-    console.print(table)
-
-    if naked_ok:
-        console.print("[green]✓ TV 版直链免凭据[/green] —— 可以 302 直连，"
-                      ".strm 也能直接写 CDN 地址，本地转发对 TV 这条路不再必需")
+    if paste:
+        console.print("[dim]浏览器登录 pan.baidu.com -> F12 -> Network -> 任一请求的 "
+                      "Cookie 头，整段复制（必须包含 BDUSS 和 STOKEN）[/dim]")
+        cookie = typer.prompt("粘贴 Cookie").strip()
+        if "BDUSS=" not in cookie:
+            _fail(MediaFansError("cookie 里没有 BDUSS，请复制完整的 Cookie 头"))
+        if "STOKEN=" not in cookie:
+            console.print("[yellow]! 没有 STOKEN：浏览和播放不受影响，但转存会失败[/yellow]")
+        pairs = [(kv.split("=", 1)[0].strip(), kv.split("=", 1)[1].strip())
+                 for kv in cookie.split(";") if "=" in kv]
+        cookie = BaiduQRLogin.clean_cookie(pairs)
     else:
-        console.print("[yellow]✗ TV 版直链同样需要凭据[/yellow] —— "
-                      "和 PC 版一样只能走本地转发，302/.strm 直连仍然不成立")
-    console.print("[dim]对照：PC 版直链裸请求一律 412（已实测）[/dim]")
+        console.print("[bold]百度扫码登录[/bold] （用百度网盘 APP 扫描终端里的二维码）")
+        flow = BaiduQRLogin()
+        try:
+            cookie = flow.login(
+                on_qr=lambda img: (
+                    render_qr_ascii(img)
+                    or console.print(f"[dim]终端画不出二维码，用浏览器打开这张图扫："
+                                     f"[/dim]\n{img}")),
+                on_event=lambda m: console.print(f"[dim]{m}[/dim]"),
+                timeout=timeout,
+            )
+        except MediaFansError as e:
+            _fail(e)
+
+    cookie_path.parent.mkdir(parents=True, exist_ok=True)
+    cookie_path.write_text(cookie, encoding="utf-8")
+    console.print(f"[green]✓[/green] cookie 已保存: {cookie_path}")
+    try:
+        name = _drive(cfg, "baidu").account_name()
+        console.print(f"[green]✓[/green] 已登录：{name}")
+    except Exception as e:
+        # cookie 已经落盘了，昵称取不到不算登录失败
+        console.print(f"[yellow]cookie 已存，但读账号信息失败：{str(e)[:80]}[/yellow]")
 
 
-# ============================================================ doctor
 @app.command()
 def doctor(offline: bool = typer.Option(False, "--offline", help="跳过网络检查")):
     """体检：配置、网盘账号、搜索源、播放器."""
@@ -257,27 +200,39 @@ def doctor(offline: bool = typer.Option(False, "--offline", help="跳过网络�
     add("配置文件", cfg.path is not None, str(cfg.path) if cfg.path else "未找到，运行 mediafans config init")
 
     # 网盘
-    quark_cfg = dict(cfg.get("drive.quark") or {})
-    quark_cfg.setdefault("cookie_file", str(cookie_file_for(cfg)))
-    has_provider = bool(quark_cfg.get("token_provider"))
-    has_login = bool(quark_cfg.get("cookie_file") and Path(quark_cfg["cookie_file"]).exists())
-    has_cookie = bool(quark_cfg.get("cookie")) or has_provider or has_login
-    if has_provider:
-        cred_desc = "token_provider（中转站）"
-    elif has_login:
-        cred_desc = "扫码登录缓存（quark.cookie）"
-    elif quark_cfg.get("cookie"):
-        cred_desc = "静态 cookie"
-    else:
-        cred_desc = "未配置（mediafans login 扫码 / cookie / token_provider 三选一）"
-    add("夸克凭据", has_cookie, cred_desc)
-    if has_cookie and not offline:
-        try:
-            drive = create_drive("quark", quark_cfg)
-            name = drive.account_name()
-            add("夸克账号", bool(name), f"昵称: {name}" if name else "cookie 无效或已过期")
-        except MediaFansError as e:
-            add("夸克账号", False, truncate(str(e), 90))
+    for nd in ("quark", "baidu"):
+        section = dict(cfg.get(f"drive.{nd}") or {})
+        section.setdefault("cookie_file", str(cookie_file_for(cfg, nd)))
+        if nd == "baidu":
+            section.setdefault("token_file", str(baidu_token_file_for(cfg)))
+        has_provider = bool(section.get("token_provider"))
+        has_login = bool(section.get("cookie_file") and Path(section["cookie_file"]).exists())
+        has_cookie = bool(section.get("cookie")) or has_provider or has_login
+        if nd == "baidu":
+            has_token = bool(section.get("refresh_token")
+                             or (section.get("token_file") and Path(section["token_file"]).exists()))
+        else:
+            has_token = False
+        configured = has_cookie or (nd == "baidu" and has_token)
+        if not configured and nd == "quark":
+            desc = "未配置（mediafans login 扫码 / cookie / token_provider 三选一）"
+        elif not configured:
+            continue  # 百度是可选网盘，完全没配就不显示
+        else:
+            parts = []
+            if has_cookie:
+                parts.append("token_provider（中转站）" if has_provider else "登录缓存/cookie")
+            if nd == "baidu":
+                parts.append("cookie ✓" if has_cookie else "未登录（login --netdisk baidu）")
+            desc = " + ".join(parts)
+        add(f"{nd} 凭据", configured, desc, warn=configured and nd == "baidu" and not has_token)
+        if not offline and (has_cookie if nd == "quark" else has_token):
+            try:
+                drive = create_drive(nd, section)
+                name = drive.account_name()
+                add(f"{nd} 账号", bool(name), f"昵称: {name}" if name else "凭据无效或已过期")
+            except MediaFansError as e:
+                add(f"{nd} 账号", False, truncate(str(e), 90))
 
     # TMDB
     tmdb_key = cfg.get("tmdb.api_key")
@@ -342,7 +297,7 @@ def discover(
         t.add_row("剧" if i.media_type == "tv" else "影", i.title, i.year or "-",
                   f"{i.rating}", truncate(i.overview, 60))
     console.print(t)
-    console.print("[dim]下一步: mediafans search \"名称\" --netdisk quark[/dim]")
+    console.print("[dim]下一步: mediafans search \"名称\" --netdisk quark|baidu[/dim]")
 
 
 # ============================================================ search
@@ -383,12 +338,13 @@ def search_cmd(
 # ============================================================ share
 @app.command()
 def share(
-    url: str = typer.Argument(..., help="夸克分享链接"),
+    url: str = typer.Argument(..., help="网盘分享链接（夸克/百度，自动识别）"),
     code: str = typer.Option("", "--code", help="提取码（链接里带 pwd= 可省略）"),
 ):
     """查看分享链接里的文件列表."""
     try:
-        drive = _quark(_cfg())
+        cfg = _cfg()
+        drive = _drive(cfg, classify_netdisk(url) or "quark")
         ctx = drive.open_share(url, passcode=code)
         files = drive.list_share_files(ctx)
     except MediaFansError as e:
@@ -412,7 +368,7 @@ def _print_share_files(url: str, files: List[DriveFile]) -> None:
 # ============================================================ save
 @app.command()
 def save(
-    url: str = typer.Argument(..., help="夸克分享链接"),
+    url: str = typer.Argument(..., help="网盘分享链接（夸克/百度，自动识别）"),
     code: str = typer.Option("", "--code", help="提取码"),
     name: str = typer.Option("", "--name", help="只转存文件名包含该关键词的文件（多关键词空格分隔）"),
     to: str = typer.Option("", "--to", help="转存目标目录，默认用配置里的 save_dir"),
@@ -422,7 +378,7 @@ def save(
 
     try:
         cfg = _cfg()
-        drive = _quark(cfg)
+        drive = _drive(cfg, classify_netdisk(url) or "quark")
         target_dir = norm_path(to or drive.save_dir)
         console.print(f"[dim]打开分享…[/dim]")
         ctx = drive.open_share(url, passcode=code)
@@ -452,10 +408,11 @@ def save(
 @app.command("ls")
 def ls_cmd(
     path: str = typer.Argument("/", help="网盘内路径，如 /MediaFans"),
+    netdisk: str = typer.Option("quark", "--netdisk", "-d", help="quark | baidu"),
 ):
     """列出自己网盘目录."""
     try:
-        drive = _quark(_cfg())
+        drive = _drive(_cfg(), netdisk)
         p = norm_path(path)
         fid = drive.resolve_path(p)
         if not fid:
@@ -482,10 +439,11 @@ def find(
     name: str = typer.Argument(..., help="关键词（空格分隔，全部命中才匹配）"),
     root: str = typer.Option("/", "--root", help="搜索起始目录"),
     depth: int = typer.Option(3, "--depth"),
+    netdisk: str = typer.Option("quark", "--netdisk", "-d", help="quark | baidu"),
 ):
     """在网盘里按文件名找文件."""
     try:
-        drive = _quark(_cfg())
+        drive = _drive(_cfg(), netdisk)
         root_path = norm_path(root or drive.save_dir)
         with console.status("搜索中…"):
             hits = drive.find(name, root=root_path, depth=depth)
@@ -533,9 +491,10 @@ def _resolve_target(drive, target: str):
 def url(
     target: str = typer.Argument(..., help="网盘内路径或文件名关键词"),
     as_json: bool = typer.Option(False, "--json", help="输出 JSON（含请求头，供脚本使用）"),
+    netdisk: str = typer.Option("quark", "--netdisk", "-d", help="quark | baidu"),
 ):
-    """获取直链（不播放）。注意夸克直链有时效，随取随用。"""
-    _play_impl(target, no_play=True, as_json=as_json, prefer="none")
+    """获取直链（不播放）。注意直链有时效，随取随用。"""
+    _play_impl(target, no_play=True, as_json=as_json, prefer="none", netdisk=netdisk)
 
 
 @app.command()
@@ -544,17 +503,19 @@ def play(
     no_play: bool = typer.Option(False, "--no-play", help="只打印直链不启动播放器"),
     player: str = typer.Option("auto", "--player", help="auto | custom | mpv | potplayer | vlc | system | none"),
     as_json: bool = typer.Option(False, "--json"),
+    netdisk: str = typer.Option("quark", "--netdisk", "-d", help="quark | baidu"),
     proxy: Optional[bool] = typer.Option(
         None, "--proxy/--no-proxy",
         help="强制启用/禁用本地流式代理（默认：播放器带不了 Cookie 时自动启用）",
     ),
 ):
     """获取直链并启动播放器（自动带上 UA/Cookie 校验头）。"""
-    _play_impl(target, no_play=no_play, as_json=as_json, prefer=player, proxy_opt=proxy)
+    _play_impl(target, no_play=no_play, as_json=as_json, prefer=player,
+               proxy_opt=proxy, netdisk=netdisk)
 
 
 def _play_impl(target: str, no_play: bool, as_json: bool, prefer: str,
-               proxy_opt: Optional[bool] = None) -> None:
+               proxy_opt: Optional[bool] = None, netdisk: str = "quark") -> None:
     import dataclasses
 
     from .player import detect_player
@@ -564,7 +525,7 @@ def _play_impl(target: str, no_play: bool, as_json: bool, prefer: str,
     proxy_url = ""
     try:
         cfg = _cfg()
-        drive = _quark(cfg)
+        drive = _drive(cfg, netdisk)
         path, fid = _resolve_target(drive, target)
         with console.status("获取直链…"):
             pt = drive.get_play_target(fid, name=path.rsplit("/", 1)[-1])
@@ -681,6 +642,7 @@ def auto(
     no_save: bool = typer.Option(False, "--no-save", help="只找不转存"),
     to: str = typer.Option("", "--to", help="转存目标目录（默认配置里的 save_dir）"),
     probe: int = typer.Option(6, "--probe", help="实际打开验证前几个候选"),
+    netdisk: str = typer.Option("quark", "--netdisk", "-d", help="quark | baidu"),
 ):
     """一键找片：搜索 → 逐个打开验证 → 挑最合适的 → 转存。
 
@@ -692,7 +654,8 @@ def auto(
 
     try:
         cfg = _cfg()
-        drive_factory = lambda: _quark(cfg)   # noqa: E731  每个探测线程要独立实例
+        nd = netdisk.lower()
+        drive_factory = lambda: _drive(cfg, nd)   # noqa: E731  每个探测线程要独立实例
 
         def _do_search(kw, netdisk=None):
             providers = build_providers(cfg.get("search") or {})
@@ -726,7 +689,7 @@ def auto(
                          year=year, season=season, episodes=episodes,
                          save_dir=to, picker=_picker(cfg),
                          probe_top=probe, do_save=not no_save,
-                         on_step=on_step)
+                         netdisk=nd, on_step=on_step)
     except MediaFansError as e:
         _fail(e)
 
@@ -791,11 +754,13 @@ def web(
             providers = build_providers(cfg.get("search") or {})
             return aggregate_search(providers, kw, netdisk=netdisk)
 
-        from .config import tv_token_file_for, watch_file_for
+        from .config import baidu_token_file_for, tv_token_file_for, watch_file_for
 
-        app_ = WebApp(lambda: _quark(cfg), search_fn=_do_search, host=host, port=port,
+        app_ = WebApp(lambda nd="quark": _drive(cfg, nd), search_fn=_do_search, host=host, port=port,
                       cookie_path=cookie_file_for(cfg),
-                      tv_token_path=tv_token_file_for(cfg), token=token,
+                      cookie_paths={"quark": cookie_file_for(cfg), "baidu": cookie_file_for(cfg, "baidu")},
+                      tv_token_path=tv_token_file_for(cfg),
+                      baidu_token_path=baidu_token_file_for(cfg), token=token,
                       use_tv=not no_tv,
                       tmdb_key=str(cfg.get("tmdb.api_key") or ""),
                       picker=_picker(cfg),

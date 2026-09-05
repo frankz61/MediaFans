@@ -175,3 +175,49 @@ def test_title_rejection_is_scoped_to_local_directories():
     gentlemen = "The.Gentlemen.2024.S01E02.2160p.Web.DV.HDR.H265.mkv"
     assert belongs(gentlemen, silo, title_can_reject=True) == "别的作品"
     assert belongs(gentlemen, silo) is None      # 分享粒度不据此拒
+
+
+# ---------------------------------------------------------------- 合集里蹭进来的
+def test_short_drama_is_not_the_show():
+    """短剧合集常有一层恰好带上热播剧的名字，里面按「第N集」编号，集号完全重叠。
+
+    实测搜末日地堡时，「进击的巨人之末日地堡（60集）Ai短剧」整份被当成了来源，
+    30MB 一集的竖屏短剧排进了正片的集列表。TMDB 上的正片不会是短剧。
+    """
+    from mediafans.agent import Work, belongs
+
+    w = Work(titles=["末日地堡", "Silo"], animation=False)
+    assert belongs("15/进击的巨人之末日地堡（60集）Ai短剧/第1集.mp4", w) == "短剧"
+    assert belongs("M 末日地堡（羊毛战记）/第3季/Silo.S03E01.mkv", w) is None
+
+
+def test_require_title_rejects_unrelated_files_in_a_mixed_share():
+    """分享粒度的判断太松：合集里只要有一层带剧名，整份文件都会拿到资格。
+
+    实测一个短剧合集因此让「十八年后被认亲，我被太子爹爹宠上天」也进了
+    末日地堡的集列表——那是一部毫不相干的剧，只是文件叫「第2集.mp4」。
+    """
+    from mediafans.agent import Work, belongs
+
+    w = Work(titles=["末日地堡", "Silo"], animation=False)
+    unrelated = "某合集/14/十八年后被认亲，我被太子爹爹宠上天（65集）/第2集.mp4"
+    assert belongs(unrelated, w, require_title=True) == "路径里没提到本剧"
+    assert belongs(unrelated, w, require_title=False) is None   # 老行为不变
+
+
+def test_require_title_still_accepts_a_matching_ancestor():
+    """片名写在目录上、文件名是裸编号，是最常见的形态，不能误杀."""
+    from mediafans.agent import Work, belongs
+
+    w = Work(titles=["异人之下"], animation=False)
+    assert belongs("异人之下（2023）全27集 4K/01.mp4", w, require_title=True) is None
+
+
+def test_require_title_is_off_when_titles_are_unusable():
+    """发布组用 TMDB 没有的别名时片名信号不可用，这条规则不能生效，
+    否则会把整份合法资源判成「没提到本剧」。"""
+    from mediafans.agent import Work, belongs
+
+    w = Work(titles=["狂飙"], animation=False)
+    assert belongs("The.Knockout.S01E01.mkv", w,
+                   trust_titles=False, require_title=True) is None

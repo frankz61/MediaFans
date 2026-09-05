@@ -87,8 +87,20 @@ def kind_verdict(path: str, animation: Optional[bool]) -> Optional[bool]:
     return is_anime if animation else is_live
 
 
+# 短剧是另一种东西：几十上百集、每集几十 MB 的竖屏微短剧。
+# 网盘里的短剧合集经常有一个文件夹恰好带上热播剧的名字（实测
+# 「进击的巨人之末日地堡（60集）Ai短剧」），里面按 `第1集.mp4` 编号，
+# 集号跟正片完全重叠。TMDB 上的正片不会是短剧，所以这个词出现即排除。
+SHORT_DRAMA_MARKS = ("短剧",)
+
+
+def is_short_drama(path: str) -> bool:
+    return any(m in (path or "") for m in SHORT_DRAMA_MARKS)
+
+
 def belongs(path: str, work: Work, trust_titles: bool = True,
-            title_can_reject: bool = False) -> Optional[str]:
+            title_can_reject: bool = False,
+            require_title: bool = False) -> Optional[str]:
     """这个文件属于目标作品吗。属于/说不准返回 None，不属于返回原因。
 
     **从最里层往外逐段看，第一个说得出话的那一段说了算。**
@@ -106,6 +118,8 @@ def belongs(path: str, work: Work, trust_titles: bool = True,
       片名信号可靠。实测某个「末日地堡」目录里混进了 `The.Gentlemen.S01E01~E08`，
       不按片名拒的话第一季会被凑成「已存 10 集」，点播放放出来的是《绅士们》。
     """
+    if is_short_drama(path):
+        return "短剧"
     for seg in reversed(_segments(path)):
         if trust_titles:
             t = title_verdict(seg, work.titles)
@@ -119,6 +133,12 @@ def belongs(path: str, work: Work, trust_titles: bool = True,
             return "动画版" if not work.animation else "真人版"
         if k is True:
             return None
+    # 整条路径从分享标题到文件名都没提过本剧。在「这份分享确实用片名命名」的
+    # 前提下（require_title），这就说明它是合集里蹭进来的别的东西——实测某个
+    # 短剧合集里有一层叫「…末日地堡…」，整份分享因此通过，然后里面
+    # 「十八年后被认亲…」这种毫不相干的剧也被按集号匹配了进来。
+    if require_title and trust_titles:
+        return "路径里没提到本剧"
     return None
 
 

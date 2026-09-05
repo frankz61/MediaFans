@@ -4,10 +4,11 @@ from typing import Dict, List
 
 from ..errors import ConfigError
 from ..models import DriveFile, PlayTarget
+from .baidu import BaiduDrive
 from .base import BaseDrive
 from .quark import QuarkDrive
 
-_REGISTRY = {"quark": QuarkDrive}
+_REGISTRY = {"quark": QuarkDrive, "baidu": BaiduDrive}
 
 
 def supported_netdisks() -> List[str]:
@@ -25,4 +26,4 @@ def create_drive(netdisk: str, cfg_section: dict, transport=None) -> BaseDrive:
     return cls(cfg_section or {}, transport=transport)
 
 
-__all__ = ["BaseDrive", "QuarkDrive", "create_drive", "supported_netdisks", "DriveFile", "PlayTarget"]
+__all__ = ["BaseDrive", "QuarkDrive", "BaiduDrive", "create_drive", "supported_netdisks", "DriveFile", "PlayTarget"]
