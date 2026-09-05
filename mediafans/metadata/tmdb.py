@@ -103,6 +103,75 @@ class TmdbClient:
         return [self._to_item(dict(x, media_type="tv"))
                 for x in self._get("/discover/tv", params)]
 
+    def chinese_movie(self, kind: str = "now") -> List[MediaItem]:
+        """华语电影榜。跟 chinese_tv 同一个理由：榜单端点不支持按语言过滤。
+
+        「正在上映」用 /discover/movie 的上映日区间自己框，比 /movie/now_playing
+        准——后者是按发行地区算的，华语片经常压根不在里面。
+        """
+        params = {"with_original_language": self.CHINESE_FILTER,
+                  "sort_by": "popularity.desc", "page": 1}
+        if kind == "now":
+            # 往前推 45 天：院线片的热度窗口比剧集长，只取当天会几乎是空的
+            params["primary_release_date.gte"] = self._cn_date(-45)
+            params["primary_release_date.lte"] = self._cn_date()
+        elif kind == "upcoming":
+            params["primary_release_date.gte"] = self._cn_date(1)
+            params["primary_release_date.lte"] = self._cn_date(90)
+            params["sort_by"] = "primary_release_date.asc"
+        else:
+            # 同 chinese_tv：热门榜按 popularity 排会顶上来没人评分的擦边条目
+            params["vote_count.gte"] = 20
+        return [self._to_item(dict(x, media_type="movie"))
+                for x in self._get("/discover/movie", params)]
+
+    def now_playing(self, page: int = 1) -> List[MediaItem]:
+        return [self._to_item(dict(x, media_type="movie"))
+                for x in self._get("/movie/now_playing", {"page": page})]
+
+    def upcoming(self, page: int = 1) -> List[MediaItem]:
+        return [self._to_item(dict(x, media_type="movie"))
+                for x in self._get("/movie/upcoming", {"page": page})]
+
+    def popular_movie(self, page: int = 1) -> List[MediaItem]:
+        return [self._to_item(dict(x, media_type="movie"))
+                for x in self._get("/movie/popular", {"page": page})]
+
+    def movie_detail(self, tmdb_id: int) -> dict:
+        """电影详情。跟 tv_detail 给出同样形状的字段，上层就不用分两套写法。
+
+        电影没有季/集，所以 total_seasons / total_episodes 恒为 0——留着字段是
+        为了让「作品」这一层保持同构，判断「是不是同一部作品」的 identity 逻辑
+        （片名 + 动画/真人）对电影一样要用。
+        """
+        params, headers = {"language": "zh-CN"}, {}
+        if self.api_key.startswith("eyJ"):
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        else:
+            params["api_key"] = self.api_key
+        with httpx.Client(timeout=self.timeout, transport=self.transport) as c:
+            r = c.get(f"{self.BASE}/movie/{int(tmdb_id)}", params=params, headers=headers)
+            r.raise_for_status()
+            body = r.json()
+        genres = [int(g.get("id") or 0) for g in (body.get("genres") or [])]
+        return {
+            "tmdb_id": int(body.get("id") or 0),
+            "title": body.get("title") or "",
+            "original_title": body.get("original_title") or "",
+            "genres": genres,
+            "animation": self.ANIMATION_GENRE in genres,
+            "year": (body.get("release_date") or "")[:4],
+            "release_date": body.get("release_date") or "",
+            "runtime": int(body.get("runtime") or 0),
+            "overview": body.get("overview") or "",
+            "poster": self.poster_url(body.get("poster_path") or ""),
+            "rating": float(body.get("vote_average") or 0),
+            "total_episodes": 0,
+            "total_seasons": 0,
+            "seasons": [],
+            "status": body.get("status") or "",
+        }
+
     def trending(self, media_type: str = "all", window: str = "week") -> List[MediaItem]:
         media_type = media_type if media_type in ("all", "movie", "tv") else "all"
         items = [self._to_item(x) for x in self._get(f"/trending/{media_type}/{window}", {})]

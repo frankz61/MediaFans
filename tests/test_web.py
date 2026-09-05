@@ -951,8 +951,9 @@ def test_page_has_a_one_click_grab_button():
     from mediafans.web import PAGE_HTML
 
     assert 'id="grabBtn"' in PAGE_HTML and "function fetchSeason()" in PAGE_HTML
-    # 没扫出来源时按了也没用，所以按可补集数决定显不显示
-    assert "grab.style.display = c.available ? '' : 'none';" in PAGE_HTML
+    # 没扫出来源时按了也没用，所以按可补集数决定显不显示；
+    # 电影只有一行，逐个版本挑才是重点，批量按钮反而碍事
+    assert "grab.style.display = (!isMovie && c.available) ? '' : 'none';" in PAGE_HTML
 
 
 # ---------------------------------------------------------------- 百度网盘全链路
@@ -1180,3 +1181,132 @@ def test_vertical_swipe_adjusts_brightness_and_volume():
     assert "touch-action:none; }" in PAGE_HTML
     # 小位移算点击，不算滑动，否则点一下就把音量改了
     assert "GESTURE_SLOP" in PAGE_HTML
+
+
+# ---------------------------------------------------------------- 电影
+def _movie_webapp(upstream_url):
+    """一个只认电影的 app：TMDB 侧只实现 movie_detail + 榜单。"""
+    from mediafans.models import MediaItem
+
+    app = make_webapp(upstream_url)
+
+    class FakeTmdb:
+        from mediafans.metadata.tmdb import TmdbClient as _T
+
+        is_chinese = staticmethod(_T.is_chinese)
+        is_animation = staticmethod(_T.is_animation)
+
+        def movie_detail(self, tmdb_id):
+            return {"tmdb_id": tmdb_id, "title": "流浪地球",
+                    "original_title": "The Wandering Earth", "year": "2019",
+                    "release_date": "2019-02-05", "animation": False,
+                    "overview": "太阳要完了。", "poster": "https://img/p.jpg",
+                    "runtime": 125, "total_seasons": 0, "total_episodes": 0,
+                    "seasons": []}
+
+        def chinese_movie(self, kind="now"):
+            return [MediaItem(title="流浪地球", original_title="The Wandering Earth",
+                              original_language="zh", media_type="movie", year="2019",
+                              rating=7.9, tmdb_id=300, poster="https://img/p.jpg")]
+
+        def now_playing(self, page=1):
+            return [MediaItem(title="Dune", original_language="en",
+                              media_type="movie", year="2021", tmdb_id=438631)]
+
+    app._tmdb = FakeTmdb()
+    app.tmdb_key = "x"
+    return app
+
+
+def test_series_endpoint_serves_movies_too(upstream_url):
+    """电影走同一个端点：它就是只有一行的「季」，下游不用分两套。"""
+    app = _movie_webapp(upstream_url)
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        d = httpx.get(base + "/api/series",
+                      params={"tmdb_id": 300, "season": 1, "media": "movie"},
+                      timeout=10).json()
+        assert d["media_type"] == "movie"
+        assert d["season"] == 0            # season 只是缓存键，电影恒为 0
+        assert d["year"] == "2019" and d["runtime"] == 125
+        assert d["counts"]["total"] == 1
+        assert d["episodes"][0]["episode"] == 1
+        assert d["seasons"] == []
+    finally:
+        app.stop()
+
+
+def test_movie_and_tv_do_not_share_a_cache_slot(upstream_url):
+    """同一个 tmdb_id 在电影和剧集里是两部作品，缓存不能串。"""
+    app = _movie_webapp(upstream_url)
+    app.api_series(300, 1, False, "quark", "movie")
+    assert app.series_cache.get(("quark", 300, 0)) is not None
+    assert app.series_cache.get(("quark", 300, 1)) is None
+
+
+def test_discover_has_movie_lists(upstream_url):
+    """「发现」页要能切到电影榜，而不是只有剧集."""
+    app = _movie_webapp(upstream_url)
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        d = httpx.get(base + "/api/discover", params={"kind": "now"}, timeout=10).json()
+        assert d["media_type"] == "movie"
+        titles = [i["title"] for i in d["items"]]
+        assert titles == ["流浪地球", "Dune"]        # 华语在前
+        assert all(i["media_type"] == "movie" for i in d["items"])
+    finally:
+        app.stop()
+
+
+def test_unknown_discover_kind_falls_back_to_tv(upstream_url):
+    """乱传 kind 不该 500——回到默认那一档就行."""
+    app = _movie_webapp(upstream_url)
+    assert app.DISCOVER["airing"][2] == "tv"
+    assert app.DISCOVER.get("乱来") is None
+
+
+def test_watch_mark_remembers_it_was_a_movie(tmp_path, upstream_url):
+    """电影没有季/集，但散片同样两者皆空——得记下类型，「继续观看」才知道去哪。"""
+    app = make_webapp(upstream_url)
+    app.watch = __import__("mediafans.watch", fromlist=["WatchStore"]).WatchStore(
+        tmp_path / "w.json")
+    app.api_watch_save({"path": "/MediaFans/流浪地球/a.mkv", "position": 600,
+                        "duration": 7500, "tmdb_id": 300, "title": "流浪地球",
+                        "year": "2019", "media_type": "movie"})
+    got = app.api_watch_recent(5)["items"][0]
+    assert got["media_type"] == "movie"
+    assert got["season"] is None and got["episode"] is None
+    app.stop()
+
+
+def test_page_can_switch_between_tv_and_movie_lists():
+    from mediafans.web import PAGE_HTML
+
+    assert "setDiscoverMedia" in PAGE_HTML and 'data-media="movie"' in PAGE_HTML
+    assert "正在上映" in PAGE_HTML and "即将上映" in PAGE_HTML
+    # 电影卡片也进详情页，不再只有「自动找片」一条路
+    assert "card.onclick = () => openSeries(it);" in PAGE_HTML
+    # 详情页对电影换措辞
+    assert "isMovie ? '找资源' : '找缺失的集'" in PAGE_HTML
+
+
+def test_inline_javascript_parses(tmp_path):
+    """整个界面是一段内联 <script>：语法错一个字符就整页白屏。
+
+    而所有 Python 测试都照样绿——它们只检查 HTML 里有没有某段文本，
+    根本不会去解析 JS。所以这里借 node 真解析一遍。
+    """
+    import re
+    import shutil
+    import subprocess
+
+    from mediafans.web import PAGE_HTML
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("没有 node，跳过 JS 语法检查")
+    js = re.search(r"<script>(.*)</script>", PAGE_HTML, re.S).group(1)
+    f = tmp_path / "page.js"
+    f.write_text(js, encoding="utf-8")
+    r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[:600]

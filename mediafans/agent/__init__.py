@@ -21,6 +21,9 @@ from .series import (
     index_sources, plan_batch, scan_local,
     cn_season, multi_search, search_queries,
 )
+from .movie import (
+    MOVIE_EPISODE, build_movie, movie_queries, movie_sources, scan_local_movie,
+)
 
 __all__ = [
     "EpisodeInfo", "SeasonSummary", "parse_episode", "summarize",
@@ -34,4 +37,6 @@ __all__ = [
     "build_series", "fetch_episode", "scan_local", "index_sources",
     "BatchGroup", "BatchResult", "plan_batch", "fetch_batch",
     "search_queries", "multi_search", "cn_season",
+    "build_movie", "movie_queries", "movie_sources", "scan_local_movie",
+    "MOVIE_EPISODE",
 ]

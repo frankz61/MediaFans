@@ -497,21 +497,33 @@ class WebApp:
             self._tmdb = TmdbClient(self.tmdb_key)
         return self._tmdb
 
+    # 榜单：剧集三档 + 电影三档。值是 (华语档参数, 全球榜端点名, media_type)
+    DISCOVER = {
+        "airing": ("airing", "airing_today", "tv"),
+        "onair": ("onair", "on_the_air", "tv"),
+        "popular": ("popular", "popular_tv", "tv"),
+        "now": ("now", "now_playing", "movie"),
+        "upcoming": ("upcoming", "upcoming", "movie"),
+        "hot": ("hot", "popular_movie", "movie"),
+    }
+
     def api_discover(self, kind: str = "airing") -> dict:
-        """每日剧集榜，华语在前。
+        """榜单，华语在前。剧集和电影共用一个端点，靠 kind 分。
 
         TMDB 的榜单是全球榜，被各国日播肥皂剧刷屏，华语内容基本挤不进去。
         所以华语单独用 /discover 取一档摆在前面，全球榜接在后面——是「优先」
-        不是「只要」，外语新剧还在，只是不占满第一屏。
+        不是「只要」，外语新片新剧还在，只是不占满第一屏。
         """
         if not self.tmdb:
-            raise MediaFansError("未配置 tmdb.api_key，无法拉取剧集榜")
-        fn = {"airing": self.tmdb.airing_today, "onair": self.tmdb.on_the_air,
-              "popular": self.tmdb.popular_tv}.get(kind, self.tmdb.airing_today)
+            raise MediaFansError("未配置 tmdb.api_key，无法拉取榜单")
+        cn_kind, global_fn, media = self.DISCOVER.get(kind) or self.DISCOVER["airing"]
+        chinese_fn = self.tmdb.chinese_movie if media == "movie" else self.tmdb.chinese_tv
+        fn = getattr(self.tmdb, global_fn)
+        what = "电影" if media == "movie" else "剧集"
         items, note = [], ""
         if self.prefer_chinese:
             try:
-                items = self.tmdb.chinese_tv(kind)
+                items = chinese_fn(cn_kind)
             except Exception as e:
                 # 华语这一档挂了不该让整个榜打不开，但也不能不吭声
                 note = f"华语榜没拉到（{str(e)[:60]}），下面是全球榜"
@@ -520,11 +532,11 @@ class WebApp:
             items += [i for i in fn() if i.tmdb_id not in seen]
         except Exception as e:
             if not items:
-                raise MediaFansError(f"拉取剧集榜失败: {str(e)[:120]}")
+                raise MediaFansError(f"拉取{what}榜失败: {str(e)[:120]}")
             note = f"全球榜没拉到（{str(e)[:60]}），下面只有华语"
-        return {"kind": kind, "note": note, "items": [{
+        return {"kind": kind, "media_type": media, "note": note, "items": [{
             "title": i.title, "original": i.original_title, "year": i.year,
-            "rating": i.rating, "overview": i.overview, "media_type": "tv",
+            "rating": i.rating, "overview": i.overview, "media_type": media,
             "chinese": self.tmdb.is_chinese(i),
             "animation": self.tmdb.is_animation(i),
             "poster": i.poster, "tmdb_id": i.tmdb_id,
@@ -580,6 +592,7 @@ class WebApp:
             raise MediaFansError("缺少 path")
         meta = {k: payload.get(k) for k in
                 ("name", "size_h", "title", "year", "poster", "ep_title")}
+        meta["media_type"] = "movie" if payload.get("media_type") == "movie" else "tv"
         for k in ("tmdb_id", "season", "episode"):
             try:
                 meta[k] = int(payload[k]) if payload.get(k) is not None else None
@@ -607,40 +620,52 @@ class WebApp:
         return {"ok": self.watch.forget(str(payload.get("path") or ""))}
 
     def api_series(self, tmdb_id: int, season: int, refresh: bool = False,
-                   nd: str = "quark") -> dict:
-        """一季的剧集矩阵。
+                   nd: str = "quark", media: str = "tv") -> dict:
+        """一季的剧集矩阵，或者一部电影。
 
-        只扫网盘、不搜资源——首屏要快（1 秒内）。找缺失集的来源很慢
-        （要开分享、递归列目录），交给 /api/series/scan 单独跑。
+        只扫网盘、不搜资源——首屏要快（1 秒内）。找来源很慢（要开分享、
+        递归列目录），交给 /api/series/scan 单独跑。
+
+        电影走同一个端点、同一份缓存：它就是只有一行的「季」（season=0），
+        下游的播放、进度、转存因此完全不用分两套。
         """
-        from .agent import build_series
+        from .agent import build_movie, build_series
 
         if not self.tmdb:
             raise MediaFansError("未配置 tmdb.api_key")
         nd = self._nd_of(nd)
-        key = (nd, int(tmdb_id), int(season))
+        is_movie = str(media or "tv") == "movie"
+        season = 0 if is_movie else int(season)
+        key = (nd, int(tmdb_id), season)
         if not refresh:
             cached = self.series_cache.get(key)
             if cached is not None:
                 # 进度变得快，缓存的是剧集结构，看没看过每次都现取
                 return self._attach_watch(dict(cached.as_dict(), cached=True), nd)
         try:
-            view = build_series(lambda: self._drive_for(nd), None, self.tmdb,
-                                int(tmdb_id), int(season), with_sources=False,
-                                netdisk=nd)
+            if is_movie:
+                view = build_movie(lambda: self._drive_for(nd), None, self.tmdb,
+                                   int(tmdb_id), with_sources=False, netdisk=nd)
+            else:
+                view = build_series(lambda: self._drive_for(nd), None, self.tmdb,
+                                    int(tmdb_id), season, with_sources=False,
+                                    netdisk=nd)
         except MediaFansError:
             raise
         except Exception as e:
-            raise MediaFansError(f"读取剧集信息失败: {str(e)[:120]}")
+            what = "影片" if is_movie else "剧集"
+            raise MediaFansError(f"读取{what}信息失败: {str(e)[:120]}")
         self.series_cache.put(key, view)
         return self._attach_watch(dict(view.as_dict(), cached=False), nd)
 
     def api_series_scan(self, payload: dict) -> dict:
-        """开一个后台任务：搜资源并把每一集能从哪补铺开。"""
-        from .agent import build_series
+        """开一个后台任务：搜资源并把每一集（电影就是那一部）能从哪补铺开。"""
+        from .agent import build_movie, build_series
 
-        tmdb_id, season = int(payload.get("tmdb_id") or 0), int(payload.get("season") or 0)
-        if not tmdb_id or not season:
+        tmdb_id = int(payload.get("tmdb_id") or 0)
+        is_movie = str(payload.get("media") or "tv") == "movie"
+        season = 0 if is_movie else int(payload.get("season") or 0)
+        if not tmdb_id or (not season and not is_movie):
             raise MediaFansError("缺少 tmdb_id / season")
         if not self.tmdb:
             raise MediaFansError("未配置 tmdb.api_key")
@@ -649,8 +674,13 @@ class WebApp:
         nd = self._nd_of(payload.get("netdisk"))
 
         def runner(on_step):
-            view = build_series(lambda: self._drive_for(nd), self.search_fn, self.tmdb,
-                                tmdb_id, season, on_step=on_step, netdisk=nd)
+            if is_movie:
+                view = build_movie(lambda: self._drive_for(nd), self.search_fn,
+                                   self.tmdb, tmdb_id, on_step=on_step, netdisk=nd)
+            else:
+                view = build_series(lambda: self._drive_for(nd), self.search_fn,
+                                    self.tmdb, tmdb_id, season, on_step=on_step,
+                                    netdisk=nd)
             self.series_cache.put((nd, tmdb_id, season), view)
             return self._attach_watch(view.as_dict(), nd)
 
@@ -1076,7 +1106,8 @@ class WebApp:
                     elif parsed.path == "/api/series":
                         self._json(200, app.api_series(
                             query.get("tmdb_id", 0), query.get("season", 1),
-                            query.get("refresh") == "1", query.get("nd", "quark")))
+                            query.get("refresh") == "1", query.get("nd", "quark"),
+                            query.get("media", "tv")))
                     elif parsed.path == "/api/watch/recent":
                         self._json(200, app.api_watch_recent(query.get("limit", 12)))
                     elif parsed.path == "/api/watch":
@@ -1328,10 +1359,17 @@ PAGE_HTML = r"""<!doctype html>
   #scanLog { padding:0 16px 8px; font-size:11px; color:var(--dim); max-height:76px;
              overflow-y:auto; }
   #discoverBar { display:flex; gap:6px; padding:8px; border-bottom:1px solid var(--line);
-                 flex:none; }
-  #discoverBar .seg { flex:1; background:#222836; color:var(--dim); border:1px solid var(--line);
-                      border-radius:6px; padding:6px 0; font-size:12px; }
+                 flex:none; align-items:center; }
+  #discoverBar .seg { background:#222836; color:var(--dim); border:1px solid var(--line);
+                      border-radius:6px; padding:6px 10px; font-size:12px; }
   #discoverBar .seg.on { background:var(--accent); color:#fff; border-color:var(--accent); }
+  /* 「剧集/电影」是作品类型，「今日播出/热门…」是榜单档位——两维不同，
+     所以分成两组：类型贴左边固定宽，档位撑满剩下的空间 */
+  #mediaSeg { display:flex; gap:4px; flex:none; padding-right:6px;
+              border-right:1px solid var(--line); }
+  #kindSeg { display:flex; gap:6px; flex:1; }
+  #kindSeg .seg { flex:1; padding:6px 0; }
+  #segFound { flex:none; }
   /* 凭据过期的提示条：错误本身没法自愈，得让人一键去重登 */
   #authBar { display:none; align-items:center; gap:10px; padding:8px 12px;
              background:#3a2a16; border-bottom:1px solid #5a4020; font-size:12px;
@@ -1585,7 +1623,7 @@ PAGE_HTML = r"""<!doctype html>
       <button class="x" onclick="hideAuthBar()">×</button>
     </div>
     <nav id="tabs">
-      <button class="tab active" id="tabbtn-shows" onclick="switchTab('shows')">追剧</button>
+      <button class="tab active" id="tabbtn-shows" onclick="switchTab('shows')">发现</button>
       <button class="tab" id="tabbtn-series" onclick="switchTab('series')">剧集</button>
       <button class="tab" id="tabbtn-watch" onclick="switchTab('watch')">最近观看</button>
       <button class="tab" id="tabbtn-search" onclick="switchTab('search')">搜资源</button>
@@ -1598,7 +1636,7 @@ PAGE_HTML = r"""<!doctype html>
           <div id="seasonTabs"></div>
           <div id="seriesStat"></div>
         </div>
-        <div id="epList"><div class="empty">从「追剧」里点一部剧，或在上面搜剧名</div></div>
+        <div id="epList"><div class="empty">从「发现」里点一部剧或电影，或在上面搜片名</div></div>
         <div id="scanLog"></div>
         <div id="seriesFoot">
           <span class="grow" id="seriesDir"></span>
@@ -1665,9 +1703,11 @@ PAGE_HTML = r"""<!doctype html>
     </div>
     <div id="tab-shows" class="tabpane" style="display:none">
       <div id="discoverBar">
-        <button class="seg on" data-kind="airing" onclick="loadShows('airing')">今日播出</button>
-        <button class="seg" data-kind="onair" onclick="loadShows('onair')">一周在播</button>
-        <button class="seg" data-kind="popular" onclick="loadShows('popular')">热门</button>
+        <span id="mediaSeg">
+          <button class="seg on" data-media="tv" onclick="setDiscoverMedia('tv')">剧集</button>
+          <button class="seg" data-media="movie" onclick="setDiscoverMedia('movie')">电影</button>
+        </span>
+        <span id="kindSeg"></span>
         <button class="seg" data-kind="found" id="segFound" style="display:none"
                 onclick="renderFound()">搜索结果</button>
       </div>
@@ -2521,12 +2561,14 @@ function watchRow(m) {
   }
   const body = el('div', 'body');
   const isEp = !!(m.tmdb_id && m.season && m.episode);
+  const isMovie = m.media_type === 'movie' && !!m.tmdb_id;
   body.appendChild(el('div', 't', m.title || m.name));
-  // 看完了就直接说「接着看下一集」——用户要的是下一步动作，不是历史记录
+  // 看完了就直接说「接着看下一集」——用户要的是下一步动作，不是历史记录。
+  // 电影没有下一集，看完了就是看完了。
   const where = isEp
     ? '第' + m.season + '季 第' + m.episode + '集'
       + (m.ep_title ? ' · ' + m.ep_title : '')
-    : (m.name || '');
+    : (isMovie ? ('电影' + (m.year ? ' · ' + m.year : '')) : (m.name || ''));
   const state = m.finished
     ? (isEp ? '已看完 · 接着看第' + (m.episode + 1) + '集' : '已看完')
     : '看到 ' + fmtTime(m.position) + (m.duration ? ' / ' + fmtTime(m.duration) : '');
@@ -2556,10 +2598,11 @@ function watchRow(m) {
 }
 
 async function resumeWatch(m) {
-  if (m.tmdb_id && m.season) {
-    // 进剧集页：看完了就落到下一集，没看完就接着这一集
+  if (m.tmdb_id && (m.season || m.media_type === 'movie')) {
+    // 进作品页：剧集看完了就落到下一集，没看完就接着这一集；
+    // 电影只有一行，openSeriesAt 会自己回到那一行
     setDriveValue(m.netdisk || 'quark');
-    await openSeriesAt(m, m.finished ? m.episode + 1 : m.episode);
+    await openSeriesAt(m, m.finished ? (m.episode || 0) + 1 : m.episode);
     return;
   }
   switchTab('mine');
@@ -2589,7 +2632,7 @@ function switchTab(name) {
   // 窄屏下靠这个类把播放区让给列表。剧集页和最近观看不加：
   // 那两页点一下就要看片，把播放器压到 24vh 反而挡事。
   document.body.classList.toggle('tab-search', name === 'search' || name === 'shows');
-  if (name === 'shows' && !showsLoaded) { showsLoaded = true; loadShows('airing'); }
+  if (name === 'shows' && !showsLoaded) { showsLoaded = true; setDiscoverMedia('tv'); }
   if (name === 'watch') renderWatch();
   if (name === 'mine' && !mineLoaded) { mineLoaded = true; loadDir(''); }
 }
@@ -2610,7 +2653,7 @@ async function searchMedia() {
   switchTab('shows');
   const box = $('#shows');
   box.innerHTML = '<div class="empty">搜索中…</div>';
-  document.querySelectorAll('#discoverBar .seg').forEach(b => b.classList.remove('on'));
+  document.querySelectorAll('#kindSeg .seg').forEach(b => b.classList.remove('on'));
   $('#segFound').style.display = '';
   $('#segFound').classList.add('on');
   try {
@@ -2626,7 +2669,8 @@ async function searchMedia() {
 }
 
 function renderFound() {
-  document.querySelectorAll('#discoverBar .seg').forEach(b =>
+  // 只动档位那一排；「剧集/电影」的切换态是另一维，别一起清掉
+  document.querySelectorAll('#kindSeg .seg, #segFound').forEach(b =>
     b.classList.toggle('on', b.id === 'segFound'));
   const box = $('#shows');
   if (!foundItems || !foundItems.length) {
@@ -2843,12 +2887,35 @@ async function saveShare() {
   }
 }
 
-// ---------------- 追剧：每日剧集 + 一键找片 ----------------
+// ---------------- 发现：剧集/电影榜 + 一键找片 ----------------
 let autoTimer = null, autoDir = '';
+
+// 剧集和电影各三档。电影的「正在上映」在后端往前推了 45 天——院线片的热度
+// 窗口比剧集长，只取当天几乎是空的。
+const DISCOVER_KINDS = {
+  tv: [['airing', '今日播出'], ['onair', '一周在播'], ['popular', '热门']],
+  movie: [['now', '正在上映'], ['upcoming', '即将上映'], ['hot', '热门']],
+};
+let discoverMedia = 'tv';
+
+function setDiscoverMedia(media) {
+  discoverMedia = media;
+  document.querySelectorAll('#mediaSeg .seg').forEach(b =>
+    b.classList.toggle('on', b.dataset.media === media));
+  const box = $('#kindSeg');
+  box.innerHTML = '';
+  for (const [kind, label] of DISCOVER_KINDS[media]) {
+    const b = el('button', 'seg', label);
+    b.dataset.kind = kind;
+    b.onclick = () => loadShows(kind);
+    box.appendChild(b);
+  }
+  loadShows(DISCOVER_KINDS[media][0][0]);
+}
 
 async function loadShows(kind) {
   const seq = ++showsSeq;
-  document.querySelectorAll('#discoverBar .seg').forEach(b =>
+  document.querySelectorAll('#kindSeg .seg, #segFound').forEach(b =>
     b.classList.toggle('on', b.dataset.kind === kind));
   const box = $('#shows');
   box.innerHTML = '<div class="empty">加载中…</div>';
@@ -2890,10 +2957,12 @@ function renderCards(items, note) {
     card.appendChild(cap);
     const isMovie = it.media_type === 'movie';
     card.title = (it.overview || it.title) + '\n\n'
-      + (isMovie ? '点击自动找片并转存' : '点击按季/集查看，右键一键找全季');
-    // 电影没有季集结构，走一键找片；剧集进季/集矩阵
-    card.onclick = () => isMovie ? startAuto(it) : openSeries(it);
-    if (!isMovie) card.oncontextmenu = (e) => { e.preventDefault(); startAuto(it); };
+      + (isMovie ? '点击查看这部片，右键一键找片'
+                 : '点击按季/集查看，右键一键找全季');
+    // 电影和剧集都进详情页：电影就是只有一行的「季」，转存/播放/进度全都一样。
+    // 右键仍然是「别问了直接找一份存下来」的快捷方式。
+    card.onclick = () => openSeries(it);
+    card.oncontextmenu = (e) => { e.preventDefault(); startAuto(it); };
     box.appendChild(card);
   });
 }
@@ -3029,24 +3098,30 @@ let seriesShow = null;
 async function openSeries(item, season) {
   clearInterval(seriesJobTimer);
   switchTab('series');
+  const media = item.media_type === 'movie' ? 'movie' : 'tv';
   seriesShow = { tmdb_id: item.tmdb_id, title: item.title, year: item.year || '',
-                 poster: item.poster || '' };
+                 poster: item.poster || '', media_type: media };
+  $('#tabbtn-series').textContent = media === 'movie' ? '影片' : '剧集';
   $('#seriesTitle').textContent = item.title + (item.year ? '（' + item.year + '）' : '');
   $('#seasonTabs').innerHTML = '';
   $('#epList').innerHTML = '<div class="empty">读取中…</div>';
   $('#scanLog').textContent = '';
   $('#seriesStat').textContent = '';
   $('#seriesDir').textContent = '';
-  await loadSeason(item.tmdb_id, season || 1);
+  // 电影没有季，用 season=0 占位；后端认 media 参数，season 只是缓存键的一部分
+  await loadSeason(item.tmdb_id, media === 'movie' ? 0 : (season || 1), false, media);
 }
 
 // 从「最近观看」回到剧集页，并直接接着播目标集。
 // 目标集没存下来就只把矩阵摆出来——那时候用户要做的是补这一集，不是播。
 async function openSeriesAt(mark, episode) {
+  const media = mark.media_type === 'movie' ? 'movie' : 'tv';
   await openSeries({ tmdb_id: mark.tmdb_id, title: mark.title, year: mark.year,
-                     poster: mark.poster }, mark.season);
+                     poster: mark.poster, media_type: media }, mark.season);
   const d = series && series.data;
   if (!d) return;
+  // 电影只有一行，「下一集」这个概念不存在，永远回到那一行
+  if (media === 'movie') episode = (d.episodes[0] || {}).episode;
   const ep = (d.episodes || []).find(e => e.episode === episode);
   if (ep && ep.local) playEpisode(d, ep);
   else if (ep) {
@@ -3055,11 +3130,13 @@ async function openSeriesAt(mark, episode) {
   }
 }
 
-async function loadSeason(tmdbId, season, refresh) {
-  series = { tmdb_id: tmdbId, season };
+async function loadSeason(tmdbId, season, refresh, media) {
+  media = media || (series && series.media) || 'tv';
+  series = { tmdb_id: tmdbId, season, media };
   $('#epList').innerHTML = '<div class="empty">读取中…</div>';
   try {
-    const qs = `tmdb_id=${tmdbId}&season=${season}&nd=${curNd}` + (refresh ? '&refresh=1' : '');
+    const qs = `tmdb_id=${tmdbId}&season=${season}&nd=${curNd}&media=${media}`
+             + (refresh ? '&refresh=1' : '');
     const d = await (await fetch('/api/series?' + qs)).json();
     if (d.error) throw new Error(d.error);
     series.data = d;
@@ -3074,6 +3151,12 @@ async function loadSeason(tmdbId, season, refresh) {
 function renderSeasons(d) {
   const box = $('#seasonTabs');
   box.innerHTML = '';
+  if (d.media_type === 'movie') {
+    // 电影没有季可切，这一栏改放片长/上映年份，空着显得像加载失败
+    const bits = [d.year, d.runtime ? d.runtime + ' 分钟' : ''].filter(Boolean);
+    if (bits.length) box.appendChild(el('span', 'dim', bits.join('　·　')));
+    return;
+  }
   for (const s of d.seasons || []) {
     if (!s.episodes) continue;
     const b = el('button', s.season === d.season ? 'on' : null,
@@ -3085,39 +3168,54 @@ function renderSeasons(d) {
 
 function renderEpisodes(d) {
   const c = d.counts;
-  $('#seriesStat').innerHTML =
-    `共 ${c.total} 集 · <b>已存 ${c.saved}</b>` +
-    (c.available ? ` · <i>可补 ${c.available}</i>` : '') +
-    (c.missing ? ` · <u>缺 ${c.missing}</u>` : '');
+  const isMovie = d.media_type === 'movie';
+  const row0 = d.episodes[0] || {};
+  // 电影只有一行，「共 1 集 · 已存 1」这种说法没意义，直接说状态
+  $('#seriesStat').innerHTML = isMovie
+    ? (c.saved ? '<b>网盘里已经有了</b>'
+               : (row0.sources && row0.sources.length
+                  ? `<i>${row0.sources.length} 个版本可以转存</i>` : '<u>网盘里还没有</u>'))
+    : `共 ${c.total} 集 · <b>已存 ${c.saved}</b>`
+      + (c.available ? ` · <i>可补 ${c.available}</i>` : '')
+      + (c.missing ? ` · <u>缺 ${c.missing}</u>` : '');
   $('#seriesDir').textContent = d.local_dir || '';
   $('#scanBtn').style.display = c.saved === c.total ? 'none' : '';
-  $('#scanBtn').textContent = '找缺失的集';
+  $('#scanBtn').textContent = isMovie ? '找资源' : '找缺失的集';
   $('#scanBtn').disabled = false;
-  // 有来源可补才给「一键转存」——没扫过的时候按了也没用
+  // 有来源可补才给「一键转存」——没扫过的时候按了也没用。
+  // 电影只有一行，逐个版本挑才是重点，批量按钮反而碍事。
   const grab = $('#grabBtn');
-  grab.style.display = c.available ? '' : 'none';
+  grab.style.display = (!isMovie && c.available) ? '' : 'none';
   grab.textContent = '一键转存 ' + c.available + ' 集';
   grab.disabled = false;
   const box = $('#epList');
   box.innerHTML = '';
-  if (!d.episodes.length) { box.innerHTML = '<div class="empty">这一季还没有集信息</div>'; return; }
+  if (!d.episodes.length) {
+    box.innerHTML = '<div class="empty">' + (isMovie ? '没有影片信息' : '这一季还没有集信息')
+                    + '</div>';
+    return;
+  }
+  if (isMovie && d.overview) box.appendChild(el('div', 'pad dim', d.overview));
   for (const ep of d.episodes) box.appendChild(epRow(d, ep));
   for (const n of d.notes || []) box.appendChild(el('div', 'pad dim', '· ' + n));
 }
 
 function epRow(d, ep) {
   const w = ep.watched;
+  const isMovie = d.media_type === 'movie';
   const row = el('div', 'ep ' + ep.status + (w && w.finished ? ' done' : '')
                  + (curPath && ep.local && ep.local.path === curPath ? ' playing' : ''));
   row.id = 'ep-' + ep.episode;
-  row.appendChild(el('span', 'no', 'E' + String(ep.episode).padStart(2, '0')));
+  row.appendChild(el('span', 'no', isMovie ? '影片'
+                                           : 'E' + String(ep.episode).padStart(2, '0')));
   const body = el('div', 'body');
-  body.appendChild(el('div', 'name', ep.title || ('第 ' + ep.episode + ' 集')));
+  body.appendChild(el('div', 'name',
+                      ep.title || (isMovie ? d.title : '第 ' + ep.episode + ' 集')));
   const bits = [];
   if (ep.local) {
     bits.push((ep.local.height ? ep.local.height + 'p · ' : '') + ep.local.size_h);
   } else if (ep.sources.length) {
-    bits.push(`${ep.sources.length} 个来源可补`);
+    bits.push(ep.sources.length + (isMovie ? ' 个版本可转存' : ' 个来源可补'));
   } else {
     bits.push('还没有来源');
   }
@@ -3141,7 +3239,7 @@ function epRow(d, ep) {
     b.onclick = () => playEpisode(d, ep);
     act.appendChild(b);
   } else {
-    for (const src of ep.sources.slice(0, 3)) {
+    for (const src of ep.sources.slice(0, isMovie ? 5 : 3)) {
       const b = el('button', 'pill src',
                    src.label + (src.height ? ' ' + src.height + 'p' : ''));
       b.title = `${src.share_title}\n${src.name}\n${src.size_h}` +
@@ -3165,7 +3263,7 @@ async function fetchEpisode(d, ep, src, btn) {
     });
     const res = await r.json();
     if (res.error) throw new Error(res.error);
-    await loadSeason(d.tmdb_id, d.season, true);
+    await loadSeason(d.tmdb_id, d.season, true, d.media_type);
   } catch (e) {
     reportError(e.message, curNd);
     btn.classList.remove('busy');
@@ -3177,12 +3275,19 @@ async function fetchEpisode(d, ep, src, btn) {
 // 播这一集。带上剧集上下文，进度才能记成「末日地堡 S02E08」而不是一个孤零零的路径。
 function playEpisode(d, ep, startAt) {
   const show = seriesShow || {};
+  const isMovie = d.media_type === 'movie';
+  // 电影的季/集留空：不是「第 0 季第 1 集」，是根本没有这个维度。
+  // 「最近观看」靠这个决定显示成「第 2 季 第 8 集」还是就一个片名。
   playCtx = {
     path: ep.local.path,
-    tmdb_id: d.tmdb_id, season: d.season, episode: ep.episode,
-    meta: { tmdb_id: d.tmdb_id, season: d.season, episode: ep.episode,
-            title: show.title || '', year: show.year || '', poster: show.poster || '',
-            ep_title: ep.title || '', name: ep.local.name, size_h: ep.local.size_h },
+    tmdb_id: d.tmdb_id, season: isMovie ? null : d.season,
+    episode: isMovie ? null : ep.episode,
+    meta: { tmdb_id: d.tmdb_id, media_type: isMovie ? 'movie' : 'tv',
+            season: isMovie ? null : d.season, episode: isMovie ? null : ep.episode,
+            title: show.title || d.title || '', year: show.year || d.year || '',
+            poster: show.poster || d.poster || '',
+            ep_title: isMovie ? '' : (ep.title || ''),
+            name: ep.local.name, size_h: ep.local.size_h },
   };
   const f = { path: ep.local.path, name: ep.local.name, size_h: ep.local.size_h,
               keepCtx: true };
@@ -3203,7 +3308,7 @@ function fetchSeason() {
   fetch('/api/season/fetch', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tmdb_id: series.tmdb_id, season: series.season,
-                           netdisk: curNd })
+                           media: series.media || 'tv', netdisk: curNd })
   }).then(r => r.json()).then(d => {
     if (d.error) throw new Error(d.error);
     let shown = 0;

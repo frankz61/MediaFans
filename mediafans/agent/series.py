@@ -99,6 +99,12 @@ class EpisodeRow:
 
 @dataclass
 class SeriesView:
+    """一季剧集，或者一部电影——电影就是只有一行的「季」（见 agent/movie.py）。
+
+    合成一个类是为了让下游只有一套写法：播放、进度、转存、前端渲染都不分家。
+    media_type 只影响措辞和几个按钮，不影响数据形状。
+    """
+
     tmdb_id: int
     title: str
     season: int
@@ -108,6 +114,11 @@ class SeriesView:
     dead: int = 0
     local_dir: str = ""
     notes: List[str] = field(default_factory=list)
+    media_type: str = "tv"        # tv | movie
+    year: str = ""                # 电影用；剧集的年份在 seasons 里
+    overview: str = ""
+    poster: str = ""
+    runtime: int = 0              # 电影片长（分钟）
 
     def as_dict(self) -> dict:
         rows = [r.as_dict() for r in self.rows]
@@ -116,6 +127,11 @@ class SeriesView:
             "title": self.title,
             "season": self.season,
             "seasons": self.seasons,
+            "media_type": self.media_type,
+            "year": self.year,
+            "overview": self.overview,
+            "poster": self.poster,
+            "runtime": self.runtime,
             "local_dir": self.local_dir,
             "probed": self.probed,
             "dead": self.dead,

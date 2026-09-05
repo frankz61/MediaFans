@@ -35,14 +35,17 @@ class Mark:
     duration: float = 0.0
     updated: float = 0.0
     finished: bool = False
-    # 剧集上下文，散片没有
+    # 作品上下文，散片没有
     tmdb_id: Optional[int] = None
     title: str = ""
     year: str = ""
     poster: str = ""
-    season: Optional[int] = None
-    episode: Optional[int] = None
+    season: Optional[int] = None      # 电影为 None
+    episode: Optional[int] = None     # 电影为 None
     ep_title: str = ""
+    # tv | movie。也能从 season is None 推出来，但散片同样两者皆空，
+    # 记下来「继续观看」才知道该跳回剧集页还是影片页。
+    media_type: str = "tv"
 
     @property
     def percent(self) -> int:
