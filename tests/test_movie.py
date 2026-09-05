@@ -177,3 +177,58 @@ def test_build_movie_without_search_is_scan_only():
     view = build_movie(lambda: drive, _search([_link("s1")]), FakeMovieTmdb(), 300,
                        with_sources=False)
     assert view.rows[0].sources == []
+
+
+# ---------------------------------------------------------------- 续集
+def test_sequel_is_a_different_film():
+    """《流浪地球》和《流浪地球2》是两部电影。
+
+    片名判断分不开它俩——strip_tech 把数字当技术标记剥掉了，所以
+    title_match 一定认为是同一部。实测线上搜 2019 版，4 个「版本」里混进了
+    `流浪地球2.2023.2160p.BluRay.Remux…` 和续集的幕后花絮。
+    """
+    dropped = []
+    drive = FakeDrive(shares={"s1": {"0": [
+        _f("流浪地球 .2019.2160p.BluRay.Remux.HEVC.mkv", size=BIG, fid="a"),
+        _f("流浪地球2.2023.2160p.BluRay.Remux.HEVC.mkv", size=BIG, fid="b"),
+        _f("Inside the Wandering Earth2.mkv", size=BIG, fid="c"),
+    ]}})
+    work = Work(titles=["流浪地球", "The Wandering Earth"], strict_sequel=True)
+    got = movie_sources([_probe(drive, "s1", "流浪地球 合集")], work, dropped)
+    assert [s.file.name for s in got] == ["流浪地球 .2019.2160p.BluRay.Remux.HEVC.mkv"]
+    assert sum("续集号" in d for d in dropped) == 2
+
+
+def test_sequel_check_works_the_other_way_round():
+    """反过来也要成立：找《流浪地球2》时，2019 那部才是错的那个。"""
+    work = Work(titles=["流浪地球2"], strict_sequel=True)
+    drive = FakeDrive(shares={"s1": {"0": [
+        _f("流浪地球 .2019.2160p.mkv", size=BIG, fid="a"),
+        _f("流浪地球2.2023.2160p.mkv", size=BIG, fid="b"),
+    ]}})
+    got = movie_sources([_probe(drive, "s1", "流浪地球2")], work, [])
+    assert [s.file.name for s in got] == ["流浪地球2.2023.2160p.mkv"]
+
+
+@pytest.mark.parametrize("name", [
+    "流浪地球.2019.2160p.WEB-DL.mkv",        # 年份，4 位
+    "流浪地球 2019 国语中字.mkv",             # 年份，带空格
+    "流浪地球 2160p.mkv",                    # 分辨率
+    "流浪地球 4K 高码.mkv",                  # 画质，数字后面跟着 K
+    "流浪地球：飞跃2020特别版.重映版.mkv",     # 冒号隔开，不是紧跟
+])
+def test_numbers_that_are_not_sequel_numbers(name):
+    """片名后面的数字大多不是续集号：年份、分辨率、画质。误伤这些比漏掉续集更糟。"""
+    from mediafans.agent.identity import sequel_verdict
+
+    assert sequel_verdict(name, ["流浪地球"]) is not False
+
+
+def test_sequel_check_is_off_for_tv():
+    """剧集不开这条：`末日地堡2 E01.mkv` 里的 2 常常是季号，开了会误杀正片。"""
+    from mediafans.agent.identity import belongs
+
+    tv = Work(titles=["末日地堡"])                       # strict_sequel 默认 False
+    assert belongs("末日地堡2/E01.mkv", tv, title_can_reject=True) is None
+    movie = Work(titles=["末日地堡"], strict_sequel=True)
+    assert belongs("末日地堡2/E01.mkv", movie) == "续集号对不上（《片名2》不是《片名》）"

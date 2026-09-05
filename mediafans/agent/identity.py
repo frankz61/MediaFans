@@ -49,6 +49,10 @@ class Work:
 
     titles: List[str] = field(default_factory=list)   # 中文名 + 原名
     animation: Optional[bool] = None                  # None = 不知道，就不按类型拦
+    # 片名末尾的数字算不算身份的一部分（《流浪地球》≠《流浪地球2》）。
+    # **只有电影该开**：剧集那边 `末日地堡2 E01.mkv` 里的 2 常常是季号不是续集号，
+    # 开了会把正片误杀；而剧集本来就有季号能兜住同名续作，用不着这条。
+    strict_sequel: bool = False
 
     def known(self) -> bool:
         return bool(self.titles) or self.animation is not None
@@ -69,6 +73,45 @@ def title_verdict(path: str, titles: List[str]) -> Optional[bool]:
     if len(strip_tech(path)) < 2:
         return None
     return any(title_match(t, path) >= 0.5 for t in titles if t)
+
+
+# 片名后面紧跟的数字：`流浪地球2` 是续集号，`流浪地球 2019` 是年份，
+# `沙丘 2160p` 是分辨率，`盗梦空间 4K` 是画质。区分办法是**只认 1-2 位、
+# 且后面不再接数字或 k/p/i 的那种**——续集号不会有第三位，年份和分辨率一定有。
+_AFTER_TITLE = re.compile(r"[\s._\-]{0,2}(\d{1,2})(?![\dkKpPiI])")
+
+
+def _split_sequel(title: str) -> tuple:
+    """《流浪地球2》→ ("流浪地球", 2)；《流浪地球》→ ("流浪地球", None)。"""
+    m = re.search(r"^(.*?)[\s._\-]*(\d{1,2})$", (title or "").strip())
+    if m and len(m.group(1).strip()) >= 2:
+        return m.group(1).strip(), int(m.group(2))
+    return (title or "").strip(), None
+
+
+def sequel_verdict(path: str, titles: List[str]) -> Optional[bool]:
+    """这一段里的续集号对不对得上。片名根本没出现时返回 None。
+
+    《流浪地球》和《流浪地球2》是两部电影，但 strip_tech 会把数字当技术标记
+    剥掉，所以 title_match 一定认为它俩是同一部。实测搜 2019 版《流浪地球》，
+    4 个「版本」里混进了 `流浪地球2.2023.2160p.BluRay.Remux…` 和
+    `Inside the Wandering Earth2.mkv`（续集的幕后花絮）。
+
+    电影几乎每个热门 IP 都有续集，所以这一条对电影是刚需；对剧集反而危险，
+    见 Work.strict_sequel。
+    """
+    text = path or ""
+    seen = False
+    for t in titles:
+        base, want = _split_sequel(t)
+        if len(base) < 2:
+            continue
+        for m in re.finditer(re.escape(base), text, re.I):
+            seen = True
+            hit = _AFTER_TITLE.match(text, m.end())
+            if (int(hit.group(1)) if hit else None) == want:
+                return True
+    return False if seen else None
 
 
 def kind_verdict(path: str, animation: Optional[bool]) -> Optional[bool]:
@@ -121,6 +164,11 @@ def belongs(path: str, work: Work, trust_titles: bool = True,
     if is_short_drama(path):
         return "短剧"
     for seg in reversed(_segments(path)):
+        if work.strict_sequel:
+            # 要在 title_verdict 之前问：`流浪地球2` 的片名是对得上的，
+            # 正是那个 True 会让它直接过关
+            if sequel_verdict(seg, work.titles) is False:
+                return "续集号对不上（《片名2》不是《片名》）"
         if trust_titles:
             t = title_verdict(seg, work.titles)
             if t is True:

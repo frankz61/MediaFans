@@ -168,7 +168,10 @@ def build_movie(
     base = local_dir or f"{getattr(drive, 'save_dir', '/MediaFans').rstrip('/')}/{name}"
     view.local_dir = base
     titles = [t for t in (name, detail.get("original_title") or "") if t]
-    work = Work(titles=titles, animation=detail.get("animation"))
+    # strict_sequel：电影几乎每个热门 IP 都有续集，而片名判断分不开
+    # 《流浪地球》和《流浪地球2》（数字被当技术标记剥掉了）。剧集不开这条，
+    # 那边 `末日地堡2 E01.mkv` 里的 2 常常是季号。
+    work = Work(titles=titles, animation=detail.get("animation"), strict_sequel=True)
     foreign: List[str] = []
     row.local = scan_local_movie(drive, base, work, foreign)
     step("local", "网盘里已经有了" if row.local else "网盘里还没有",
