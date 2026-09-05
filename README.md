@@ -411,14 +411,14 @@ E01-E05 2160p / E06 掉到 1080p / E07 存了两份。而且 27 集意味着开 
 | 转存「时好时坏」 | 同一个 bug 的表象。只还原 `~` 的话，seckey 里刚好不含 `/` `+` 的分享照样能成，含的就挂——按分享随机复现 |
 | 打开分享报 errno -130 | 分享还在、内容没了。`share/verify` 说提取码是对的，但 `share/list` 报 -21（文件已删），`fileNums` 也是 0。当失效跳过就行 |
 | `api/list` 对文件路径返回 errno 0 + 空列表 | 跟**空目录**长得一样。只有列表非空才能断定是目录，否则会把文件的 fid 变成路径字符串 |
+| `gettemplatevariable` 报 -6 但 `api/list` 正常 | 十有八九是 STOKEN 拿成了 passport 域那个，见下文。别急着当成登录过期 |
 | 直链下载 403 | 必须带 `User-Agent: pan.baidu.com`。浏览器 UA 403，`netdisk` UA 在 CDN 上报 sign error(31362) |
 | 解 302 之后仍然 403 | **解 302 那一跳要带 cookie**，不带的话 Location 里的签名是坏的——而错误出现在后面的 CDN 上 |
 
 **「能浏览」不等于「能转存」**：BDUSS 单独还有效时 `api/list` 一切正常，
-但网页登录态可能已经死了。实测这时访问 `pan.baidu.com/disk/home` 会被 302
-到登录页，**STOKEN 续不出来**——没有「用 BDUSS 自动续期」这条路，只能重新扫码。
-所以批量转存开工前先问一句 `gettemplatevariable`（`check_transfer_ready`），
-免得「一键转存 40 集」跑到实际转存那步才报错，前面的扫描全白等。
+但转存要的 `bdstoken` 可能拿不到。所以批量转存开工前先问一句
+`gettemplatevariable`（`check_transfer_ready`），免得「一键转存 40 集」
+跑到实际转存那步才报错，前面的扫描全白等。原因见下面「两个 STOKEN」。
 
 **「验证通过」得用转存那条通道验**。`open_share` 里加了一次 `share/list`
 探针：4 个样本上 `errno 0` ↔ 转存成功、`errno -9` ↔ 200025，完全对应。
@@ -426,11 +426,44 @@ E01-E05 2160p / E06 掉到 1080p / E07 存了两份。而且 27 集意味着开 
 就不该要登录态。wxlist 自带的 `is_zombie` 指望不上，14 条里全是 0，
 包括已经死透的那 10 条。
 
-**登录态比 cookie 短命**：实测扫码后二十来分钟到两小时，`gettemplatevariable`
-（取 `bdstoken`，转存要用）就开始报 errno -6「用户未登录」，而同一份 cookie 的
-`api/list` 一直正常。所以**取直链刻意不带 bdstoken**（实测不需要）——
-这样浏览和播放能一直用，只有转存才需要重新扫码。过期时页面会弹一条
-可以直接点的「重新扫码登录」提示，而不是甩一个 errno 出来。
+**两个 STOKEN**：这是本项目排查最久的一个坑，值得单独写。
+
+症状是「登录态过期特别快」——扫完码能用一会儿，然后 `gettemplatevariable`
+（取 `bdstoken`，转存要用）就一路报 errno -6「用户未登录」，而同一份 cookie 的
+`api/list` 一直好好的；重扫又正常一阵。看起来像是网页会话有个很短的 TTL。
+
+**不是。** 百度会在 **passport 域和 pan 域各发一个同名但值不同的 STOKEN**，
+网盘接口只认 pan 那个。扫码时所有 cookie 落在同一个 jar 里，我们按名字去重、
+**把域名丢了**，于是在两个里随便挑一个——挑中 passport 的那次就一路 -6。
+
+同一账号、同一时刻实测：
+
+| 用哪个 STOKEN | `gettemplatevariable` |
+|---|---|
+| passport 域的 | `errno=-6` |
+| **pan 域的** | `errno=0`，正常返回用户名 |
+| 只有 BDUSS 不带 STOKEN | `errno=-6` |
+
+[BaiduPCS-Rust](https://github.com/komorebiCarry/BaiduPCS-Rust) v2.1.6 修的是同一个问题
+（「passport 和 pan 域可能保存两个不同的 STOKEN，导致 errno=-6，即便 BDUSS 本身有效」），
+算是独立印证。
+
+修法两条：
+
+1. **收集 cookie 时带上域名**，同名按域名权威度挑（`utils.pick_cookies`：
+   pan > 通用 `.baidu.com` > passport）。用户从浏览器粘过来的那行没有域名，
+   退化成先到先得，行为不变。
+2. **撞到 -6 先自愈**：只要 BDUSS 还活着，访问一次 `pan.baidu.com` 服务端就会
+   重新下发 pan 域的 STOKEN。所以 `renew_session()` 换一份再重试一次，
+   换完还是 -6 才提示重新扫码。新 STOKEN 写回登录缓存文件，重启后不用再续
+   （配置里手填的 cookie 不动——那是用户的东西）。
+
+> 先前这里写的是「网页登录态比 cookie 短命，实测二十来分钟到两小时」。
+> **那个结论是错的。** 当时判断「STOKEN 续不出来」的那次测试本身也有问题：
+> 只发了 BDUSS + BAIDUID、把 STOKEN 丢了，pan 域当然不认这个会话。
+> 带完整 cookie 再试就能换到新的。
+
+**取直链刻意不带 bdstoken**（实测不需要），所以浏览和播放从头到尾不受这一切影响。
 
 ### 播放器：悬浮控制条 + 手势
 
