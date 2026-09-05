@@ -266,7 +266,7 @@ def test_open_share_and_list(tmp_path):
     assert state["wxlist"]["root"] == "1"
     assert ctx.extra["shareid"] == "900001"
     assert ctx.extra["uk"] == "800002"
-    assert ctx.extra["sekey"] == "SK-abc_def~ghi"
+    assert ctx.extra["sekey"] == "SK+abc/def=ghi"
     assert ctx.passcode == "ab12"
 
     files = drive.list_share_files(ctx)
@@ -376,41 +376,57 @@ def test_save_share_files_error_mapping():
         drive.save_share_files(ctx, [DriveFile(fid="1", name="f.mkv")], "/d")
 
 
-def test_share_seckey_padding_is_normalised():
-    """wxlist 把 base64 结尾的 padding `=` 写成 `~`，不还原的话转存失败。
+def test_share_seckey_is_urlsafe_base64():
+    """wxlist 的 seckey 是 URL-safe base64，padding 还用了 `~`：三种字符都要换回来。
 
-    实测真实 seckey 是 `...MkOKoG8E2vo~`，而 share/verify 给的 randsk 解码后是
-    `...MkOKoG8E2vo=`，只差这一个字符；拿 `~` 版当 BDCLND，百度报的是
-    errno 200025「提取码输入错误」——跟提取码毫无关系，照着错误信息查会走岔路。
+    这四对是线上逐字比对出来的：同一个分享，wxlist 的 seckey 对 share/verify
+    的 randsk（正统网页端路子），差异集恰好是 `-`→`+`、`_`→`/`、`~`→`=`。
+
+    只还原 `~` 的话，seckey 里不含 `/` `+` 的分享照样能转存——所以这个 bug 会
+    随分享「时好时坏」。挂的时候百度报 errno 200025「提取码输入错误」，
+    跟提取码毫无关系，照着错误信息查会一直走岔路。
     """
     from mediafans.drive.baidu import BaiduDrive
 
     def handler(request):
         if request.url.path == "/share/wxlist":
             return httpx.Response(200, json={"errno": 0, "data": {
-                "shareid": 1, "uk": 2, "seckey": "uQI6Ja9ZMkOKoG8E2vo~", "list": []}})
+                "shareid": 1, "uk": 2,
+                "seckey": "DYKHGNNTJ2bBWJZUHF1yTzF30mdc6cJ_ekw6EYofXd8~",
+                "list": []}})
         return httpx.Response(200, json={"errno": 0})
 
     drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=y"},
                        transport=httpx.MockTransport(handler))
     ctx = drive.open_share("https://pan.baidu.com/s/1abcdefg", "pwd1")
-    assert ctx.extra["sekey"] == "uQI6Ja9ZMkOKoG8E2vo="
+    # 同一分享 share/verify 返回的 randsk，urldecode 之后就是这个
+    assert ctx.extra["sekey"] == "DYKHGNNTJ2bBWJZUHF1yTzF30mdc6cJ/ekw6EYofXd8="
 
 
-def test_seckey_tilde_in_the_middle_is_left_alone():
-    """`~` 只在结尾是 padding；中间出现时含义不明，别乱改."""
+def test_seckey_restores_dash_to_plus():
+    """`-`→`+` 单独钉一遍：这一对最容易漏，含 `-` 的 seckey 才会踩到."""
+    from mediafans.drive.baidu import _restore_sekey
+
+    assert _restore_sekey("KjwXNB9crQtdhQl5wh5btuvH2hundPVknQid560-6Ds~") ==         "KjwXNB9crQtdhQl5wh5btuvH2hundPVknQid560+6Ds="
+
+
+def test_dead_share_errno_130_reads_as_expired():
+    """-130：share/verify 说提取码没错，但 share/list 报 -21（内容已删）。
+
+    也就是「分享还在、东西没了」。不翻译的话页面上只会甩出一个 errno=-130，
+    看起来像我们的接口调错了。
+    """
     from mediafans.drive.baidu import BaiduDrive
+    from mediafans.errors import DriveError
 
     def handler(request):
-        if request.url.path == "/share/wxlist":
-            return httpx.Response(200, json={"errno": 0, "data": {
-                "shareid": 1, "uk": 2, "seckey": "SK-abc_def~ghi", "list": []}})
-        return httpx.Response(200, json={"errno": 0})
+        return httpx.Response(200, json={"errno": -130, "errtype": 1,
+                                         "data": {"fileNums": 0, "list": []}})
 
     drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=y"},
                        transport=httpx.MockTransport(handler))
-    ctx = drive.open_share("https://pan.baidu.com/s/1abcdefg", "pwd1")
-    assert ctx.extra["sekey"] == "SK-abc_def~ghi"
+    with pytest.raises(DriveError, match="失效"):
+        drive.open_share("https://pan.baidu.com/s/1abcdefg", "pwd1")
 
 
 def test_resolve_path_does_not_mistake_a_file_for_a_dir():

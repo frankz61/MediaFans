@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from pathlib import Path
 from typing import List, Optional, Sequence
@@ -43,6 +42,7 @@ COOKIE_HELP = (
 # errno -> 人话（来自 baiduwp-php / hxz393 的错误表 + OpenList 黑名单错误码）
 _ERRNO_MSG = {
     -12: "提取码错误",
+    -130: "分享内容已被删除或失效",
     -9: "分享不存在或已失效",
     -8: "目标目录已有同名文件",
     -7: "文件名含非法字符",
@@ -68,6 +68,20 @@ _ERRNO_MSG = {
     31119: "账号命中黑名单（hit black userlist）",
     31329: "账号命中黑名单（hit black userlist / illegal dlna）",
 }
+
+
+def _restore_sekey(sekey: str) -> str:
+    """把 wxlist 的 seckey 还原成 BDCLND 要的标准 base64。
+
+    wxlist 给的是 **URL-safe base64**，而且 padding 用的是 `~` 不是 `=`：
+    `-`→`+`、`_`→`/`、`~`→`=`。三种替换缺一不可——四个分享逐字比对
+    `share/verify` 的 randsk（正统网页端路子）确认过，差异集恰好就是这三对。
+
+    只还原了 `~` 的话，seckey 里不含 `/` `+` 的分享照样能转存，含的就挂，
+    而百度报的错是「提取码输入错误」(200025)——跟提取码毫无关系，
+    照着错误信息查会一直走岔路，还会误以为是分享本身的问题。
+    """
+    return sekey.replace("-", "+").replace("_", "/").replace("~", "=")
 
 
 def _errno_msg(errno, body: dict) -> str:
@@ -330,12 +344,7 @@ class BaiduDrive(BaseDrive):
         sekey = str(data.get("seckey") or "")
         if not shareid or not sekey:
             raise DriveError("分享信息不完整（缺少 shareid/seckey），分享可能已失效")
-        # wxlist 返回的 seckey 把 base64 结尾的 padding `=` 写成了 `~`，
-        # 直接拿去当 BDCLND 校验不过，而百度报的错是「提取码输入错误」(200025)
-        # ——跟提取码毫无关系，照着错误信息查会一直走岔路。
-        # 实测 share/verify 的 randsk 解码后就是 `=` 版，两者只差这一个字符。
-        # 只还原结尾：`~` 不是合法 base64 字符，但中间出现时含义不明，不乱动。
-        sekey = re.sub(r"~+$", lambda m: "=" * len(m.group()), sekey)
+        sekey = _restore_sekey(sekey)
         return ShareContext(url=share_url, pwd_id=surl, passcode=code, extra={
             "surl": "1" + surl if surl else "",
             "legacy": legacy,       # {"uk":..,"shareid":..} 旧式链接
@@ -375,7 +384,7 @@ class BaiduDrive(BaseDrive):
         msg = str(resp.get("show_msg") or resp.get("errtype") or "")
         if "mispw" in msg or errno in (-9, -12, 5):
             raise DriveError(f"提取码错误或缺失: {msg or _errno_msg(errno, resp)}")
-        if "mis_" in msg or errno in (105, 10, 116, -4, 3, 0):
+        if "mis_" in msg or errno in (105, 10, 116, -4, 3, 0, -130):
             raise DriveError(f"分享已失效或不可访问: {msg or _errno_msg(errno, resp)}")
         raise DriveError(f"打开百度分享失败: {_errno_msg(errno, resp)}")
 
