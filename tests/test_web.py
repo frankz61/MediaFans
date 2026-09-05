@@ -1359,12 +1359,44 @@ def test_fetch_all_needs_sources_first(upstream_url):
     app.stop()
 
 
+def _js_fn(name: str) -> str:
+    """从页面 JS 里抠出一个函数体（到下一个顶格 `function` 为止）。
+
+    直接在整页 HTML 上断言某行存在太弱：`const at = video.currentTime` 在
+    fallbackToProxy 里本来就有，写在 switchSource 里没有都照样绿。
+    """
+    import re
+
+    from mediafans.web import PAGE_HTML
+
+    m = re.search(r"^function " + name + r"\(.*?(?=^function )", PAGE_HTML,
+                  re.S | re.M)
+    assert m, f"页面里没有 {name}()"
+    return m.group(0)
+
+
 def test_page_can_switch_sources_while_playing():
     from mediafans.web import PAGE_HTML
 
     assert 'id="sources"' in PAGE_HTML and "function switchSource" in PAGE_HTML
     # 换来源要接着当前进度播，而不是从头开始
-    assert "const at = video.currentTime || 0;" in PAGE_HTML
+    body = _js_fn("switchSource")
+    assert "video.currentTime" in body and "startAt: at" in body
+    assert "keepCtx: true" in body          # 别把剧集上下文丢了，进度会记到散片上
     # 解不了这个文件时自动换一份，别让用户先看懂 HEVC/DTS-HD 再自己点
     assert "const alt = nextBestCopy();" in PAGE_HTML
     assert "已自动换到" in PAGE_HTML
+
+
+def test_every_series_call_from_the_page_sends_media():
+    """电影页点「找资源」曾经直接 400：scanSources 少发了 media。
+
+    漏掉的原因是我的线上验证脚本直接带 media 调的接口，绕过了前端，
+    所以接口是好的、按钮是坏的。这里把四个调用点一起钉住。
+    """
+    for fn, ep in (("scanSources", "/api/series/scan"),
+                   ("fetchSeason", "/api/season/fetch"),
+                   ("fetchAllSources", "/api/episode/fetch/all")):
+        body = _js_fn(fn)
+        assert ep in body, f"{fn} 不再调用 {ep}？"
+        assert "media" in body, f"{fn} 没有把 media 发出去"

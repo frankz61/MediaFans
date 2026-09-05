@@ -3332,7 +3332,7 @@ function renderEpisodes(d) {
       + (c.missing ? ` · <u>缺 ${c.missing}</u>` : '');
   $('#seriesDir').textContent = d.local_dir || '';
   $('#scanBtn').style.display = c.saved === c.total ? 'none' : '';
-  $('#scanBtn').textContent = isMovie ? '找资源' : '找缺失的集';
+  $('#scanBtn').textContent = scanLabel();
   $('#scanBtn').disabled = false;
   // 有来源可补才给「一键转存」——没扫过的时候按了也没用。
   // 电影只有一行，逐个版本挑才是重点，批量按钮反而碍事。
@@ -3580,6 +3580,12 @@ function fetchSeason() {
   });
 }
 
+// 「找资源」按钮的文案只有这一个出处：之前 renderEpisodes 和出错分支各写各的，
+// 电影页一报错按钮就变回「找缺失的集」了
+function scanLabel() {
+  return (series && series.media === 'movie') ? '找资源' : '找缺失的集';
+}
+
 function scanSources() {
   if (!series) return;
   const btn = $('#scanBtn');
@@ -3590,7 +3596,7 @@ function scanSources() {
   fetch('/api/series/scan', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tmdb_id: series.tmdb_id, season: series.season,
-                           netdisk: curNd })
+                           media: series.media || 'tv', netdisk: curNd })
   }).then(r => r.json()).then(d => {
     if (d.error) throw new Error(d.error);
     let shown = 0;
@@ -3615,7 +3621,8 @@ function scanSources() {
       renderEpisodes(st.result);
     }, 900);
   }).catch(e => {
-    btn.disabled = false; btn.textContent = '找缺失的集';
+    btn.disabled = false;
+    btn.textContent = scanLabel();
     $('#scanLog').textContent = '启动失败：' + e.message;
   });
 }
