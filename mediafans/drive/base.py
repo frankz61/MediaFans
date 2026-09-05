@@ -107,6 +107,14 @@ class BaseDrive:
         """转存到自己的网盘目录，返回新文件 fid 列表."""
         raise NotImplementedError
 
+    def check_transfer_ready(self) -> None:
+        """批量转存前的预检：登录态不行就现在抛，别等跑到一半。
+
+        默认什么都不做——夸克的 cookie 能撑很久，没必要每次多打一个请求。
+        百度覆盖了它：网页登录态实测只有二十来分钟到两小时，不预检的话
+        用户要等「逐个打开验证」跑完才看到一句转存失败。
+        """
+
     # ---- 播放 ----
     def get_play_target(self, fid: str, name: str = "") -> PlayTarget:
         raise NotImplementedError

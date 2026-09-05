@@ -359,6 +359,12 @@ E01-E05 2160p / E06 掉到 1080p / E07 存了两份。而且 27 集意味着开 
 | 直链下载 403 | 必须带 `User-Agent: pan.baidu.com`。浏览器 UA 403，`netdisk` UA 在 CDN 上报 sign error(31362) |
 | 解 302 之后仍然 403 | **解 302 那一跳要带 cookie**，不带的话 Location 里的签名是坏的——而错误出现在后面的 CDN 上 |
 
+**「能浏览」不等于「能转存」**：BDUSS 单独还有效时 `api/list` 一切正常，
+但网页登录态可能已经死了。实测这时访问 `pan.baidu.com/disk/home` 会被 302
+到登录页，**STOKEN 续不出来**——没有「用 BDUSS 自动续期」这条路，只能重新扫码。
+所以批量转存开工前先问一句 `gettemplatevariable`（`check_transfer_ready`），
+免得「一键转存 40 集」跑到实际转存那步才报错，前面的扫描全白等。
+
 **登录态比 cookie 短命**：实测扫码后二十来分钟到两小时，`gettemplatevariable`
 （取 `bdstoken`，转存要用）就开始报 errno -6「用户未登录」，而同一份 cookie 的
 `api/list` 一直正常。所以**取直链刻意不带 bdstoken**（实测不需要）——

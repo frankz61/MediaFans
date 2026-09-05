@@ -406,6 +406,16 @@ class BaiduDrive(BaseDrive):
             page += 1
         return files
 
+    def check_transfer_ready(self) -> None:
+        """批量转存前先问一句登录态。
+
+        BDUSS 单独还活着时 `api/list` 照常能用，所以「能浏览」不代表「能转存」，
+        不能拿列目录当健康检查。实测 BDUSS 还有效时访问 `/disk/home` 也会被
+        302 到登录页，STOKEN 续不出来——网页登录态一死就只能重新扫码。
+        """
+        self._require_stoken()
+        self._bdstoken()
+
     def save_share_files(self, ctx: ShareContext, files: Sequence[DriveFile],
                          to_dir: str) -> List[str]:
         self._require_stoken()

@@ -705,6 +705,8 @@ class WebApp:
         groups = plan_batch(rows)
         if not groups:
             raise MediaFansError("没有可以补的集（都已存在，或还没找到来源）")
+        # 登录态先问一句：40 集的活跑到一半才发现要重登，前面的等待全白费
+        self._drive_for(nd).check_transfer_ready()
 
         def runner(on_step):
             on_step("plan", {"message":

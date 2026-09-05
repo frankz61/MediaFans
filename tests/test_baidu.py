@@ -469,3 +469,39 @@ def test_resolve_path_handles_an_empty_dir():
     drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=y"},
                        transport=httpx.MockTransport(handler))
     assert drive.resolve_path("/MediaFans/空") == "/MediaFans/空"
+
+
+def test_check_transfer_ready_catches_dead_web_session():
+    """能浏览 ≠ 能转存：BDUSS 还活着时 api/list 正常，但网页登录态可能已经死了。
+
+    所以预检必须问 gettemplatevariable，不能拿列目录当健康检查——否则
+    「一键转存 40 集」要跑到实际转存那一步才报错，前面的扫描全白等。
+    """
+    from mediafans.errors import ConfigError
+
+    def handler(request):
+        if request.url.path == "/api/gettemplatevariable":
+            return httpx.Response(200, json={"errno": -6, "result": []})
+        return httpx.Response(200, json={"errno": 0, "list": [{"path": "/x"}]})
+
+    drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=y"},
+                       transport=httpx.MockTransport(handler))
+    with pytest.raises(ConfigError, match="重新扫码"):
+        drive.check_transfer_ready()
+
+
+def test_check_transfer_ready_passes_when_logged_in():
+    def handler(request):
+        return httpx.Response(200, json={
+            "errno": 0, "result": {"bdstoken": "d" * 32, "username": "u"}})
+
+    drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=y"},
+                       transport=httpx.MockTransport(handler))
+    drive.check_transfer_ready()          # 不抛就算过
+
+
+def test_check_transfer_ready_is_a_noop_by_default():
+    """夸克不该为此多打一个请求——cookie 能撑很久."""
+    from mediafans.drive.base import BaseDrive
+
+    BaseDrive({}).check_transfer_ready()
