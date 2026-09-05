@@ -422,3 +422,50 @@ def test_build_series_stops_at_the_first_wave_when_it_covers_everything():
     build_series(lambda: drive, lambda kw, netdisk=None: (links, []),
                  FakeTmdb(3), 1, 2, probe_top=2)
     assert opened == ["a", "b"], "两个来源就够挑了，不该再探后面的"
+
+
+def test_copies_rank_recognized_video_above_higher_resolution():
+    """「画质最高」不等于「最该先播」。
+
+    网盘没认成视频的那些根本没有转码档（夸克实测：一批 .mkv 被标成 image/png，
+    `/file` streaming 回「21005 not video」），只剩原画一档，浏览器碰上
+    HEVC/DTS-HD 就是黑屏。哪怕它标着 2160p，也该让位给有转码档的 1080p。
+    """
+    from mediafans.agent import EpisodeRow, LocalFile
+
+    row = EpisodeRow(episode=1)
+    row.add_copy(LocalFile(path="/d/a.mkv", name="a.mkv", size=9, height=2160,
+                           category="image"))
+    row.add_copy(LocalFile(path="/d/b.mp4", name="b.mp4", size=3, height=1080,
+                           category="video"))
+    assert [c.name for c in row.copies] == ["b.mp4", "a.mkv"]
+    assert row.local.name == "b.mp4"          # 主副本跟着换
+
+
+def test_unknown_category_is_treated_as_playable():
+    """网盘没说类型时按能转码算——宁可少排序，也别误伤。"""
+    from mediafans.agent import LocalFile
+
+    assert LocalFile(path="/d/a.mp4", name="a", size=1).transcodable is True
+    assert LocalFile(path="/d/a.mp4", name="a", size=1,
+                     category="video").transcodable is True
+    assert LocalFile(path="/d/a.mkv", name="a", size=1,
+                     category="image").transcodable is False
+
+
+def test_scan_local_carries_category_through():
+    from mediafans.agent import scan_local
+    from mediafans.models import DriveFile
+
+    class D:
+        def resolve_path(self, p):
+            return "fid"
+
+        def list_files(self, fid):
+            return [DriveFile(fid="1", name="Show.S01E01.2160p.mkv", size=9,
+                              category="image"),
+                    DriveFile(fid="2", name="Show.S01E01.1080p.mp4", size=3,
+                              category="video")]
+
+    got = scan_local(D(), "/d", 1)[1]
+    assert [c.category for c in got] == ["video", "image"]

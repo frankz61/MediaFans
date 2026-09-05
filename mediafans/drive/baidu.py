@@ -86,6 +86,10 @@ def _restore_sekey(sekey: str) -> str:
     return sekey.replace("-", "+").replace("_", "/").replace("~", "=")
 
 
+# 百度列目录返回的 category 是数字
+_BD_CATEGORY = {1: "video", 2: "audio", 3: "image", 4: "doc", 5: "app", 6: "other"}
+
+
 def _errno_msg(errno, body: dict) -> str:
     extra = ""
     if isinstance(body, dict):
@@ -316,6 +320,8 @@ class BaiduDrive(BaseDrive):
             updated_at=BaiduDrive._fmt_time(
                 it.get("server_mtime") or it.get("server_ctime")
             ),
+            # 百度的 category 是数字：1 视频 / 2 音乐 / 3 图片 / 4 文档 / 6 其它
+            category=_BD_CATEGORY.get(int(it.get("category") or 0), ""),
         )
         if in_share:
             f.share_fid_token = str(it.get("fs_id") or "")

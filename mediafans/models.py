@@ -47,6 +47,10 @@ class DriveFile:
     size: int = 0
     updated_at: str = ""
     share_fid_token: str = ""  # 仅分享文件列表里有，转存时需要
+    # 网盘自己给这个文件打的类型（video / image / doc / …），列目录时白送。
+    # 值得留着：夸克只给它认成 video 的文件转码，认成别的（实测有一批 .mkv 被
+    # 标成 image/png）就只有原画一档，播不动也换不了档。空字符串 = 网盘没说。
+    category: str = ""
 
 
 @dataclass

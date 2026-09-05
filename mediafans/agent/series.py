@@ -37,11 +37,21 @@ class LocalFile:
     size: int
     height: int = 0
     source: str = ""
+    # 网盘把它认成什么（video / image / …）。夸克只给 video 转码——
+    # 实测同一个目录里有一批 .mkv 被标成 image/png，`/file` streaming 直接回
+    # 「21005 not video」，于是只有原画一档，浏览器多半解不了又没得换。
+    category: str = ""
+
+    @property
+    def transcodable(self) -> bool:
+        """网盘认它是视频吗。空字符串当作「网盘没说」，按能转码算，别误伤。"""
+        return self.category in ("", "video")
 
     def as_dict(self) -> dict:
         return {"path": self.path, "name": self.name, "size": self.size,
                 "size_h": fmt_size(self.size), "height": self.height,
-                "source": self.source}
+                "source": self.source, "category": self.category,
+                "transcodable": self.transcodable}
 
 
 @dataclass
@@ -96,11 +106,11 @@ class EpisodeRow:
         self.copies = [f] if f else []
 
     def add_copy(self, f: LocalFile) -> None:
-        """新转存下来的一份。同名的算同一份，按画质体积重排."""
+        """新转存下来的一份。同名的算同一份，重排一次."""
         if any(c.path == f.path for c in self.copies):
             return
         self.copies.append(f)
-        self.copies.sort(key=lambda c: (-c.height, -c.size))
+        self.copies.sort(key=copy_rank)
 
     @property
     def status(self) -> str:
@@ -170,6 +180,16 @@ class SeriesView:
                 "missing": sum(1 for r in rows if r["status"] == "missing"),
             },
         }
+
+
+def copy_rank(c: LocalFile):
+    """副本排序：网盘认得的视频优先，然后才是画质和体积。
+
+    「画质最高」不等于「最该先播」——网盘没认成视频的那些根本没有转码档，
+    只有原画一档，浏览器碰上 HEVC/DTS-HD 就是黑屏。哪怕它标着 2160p，
+    也该让位给一个有转码档的 1080p。
+    """
+    return (not c.transcodable, -c.height, -c.size)
 
 
 class SeriesCache:
@@ -252,9 +272,10 @@ def scan_local(drive, path: str, season: Optional[int],
             continue
         out.setdefault(info.episode, []).append(LocalFile(
             path=f"{path.rstrip('/')}/{f.name}", name=f.name,
-            size=f.size, height=info.height, source=info.source))
+            size=f.size, height=info.height, source=info.source,
+            category=f.category))
     for lst in out.values():
-        lst.sort(key=lambda c: (-c.height, -c.size))
+        lst.sort(key=copy_rank)
     return out
 
 

@@ -311,3 +311,16 @@ def test_api_error_message_surfaced():
 
     with pytest.raises(DriveError, match="登录失效"):
         make_drive(handler).list_files("0")
+
+
+# ---------------------------------------------------------------- 转码档
+def test_list_keeps_the_netdisk_file_category():
+    """夸克列目录时就告诉了我们它把文件当成什么，别丢掉——只有 video 才有转码档。"""
+    from mediafans.drive.quark import QuarkDrive
+
+    f = QuarkDrive._to_file({"fid": "F1", "file_name": "01x.mkv", "size": 1,
+                             "obj_category": "image"})
+    assert f.category == "image"
+    v = QuarkDrive._to_file({"fid": "F2", "file_name": "a.mp4", "size": 1,
+                             "obj_category": "video"})
+    assert v.category == "video"

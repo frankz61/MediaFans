@@ -139,6 +139,7 @@ class QuarkDrive(BaseDrive):
             is_dir=bool(it.get("dir", False)),
             size=int(it.get("size") or 0),
             updated_at=QuarkDrive._fmt_time(it.get("updated_at")),
+            category=str(it.get("obj_category") or ""),
         )
 
     def list_files(self, dir_fid: str = "0", page_size: int = 100) -> List[DriveFile]:

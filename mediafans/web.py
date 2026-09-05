@@ -2111,10 +2111,21 @@ function copyLabel(c) {
   return bits.filter(Boolean).join(' · ') || c.name;
 }
 
-// .mkv 装的常常是 HEVC/DTS-HD，浏览器解不了却又不报错，只会黑屏一直下载。
-// 不能据此拒绝（很多 mkv 是能播的），但换来源时优先挑不是 mkv 的那个。
+// 这一份有多大可能播不动。两个信号：
+//   1. 网盘没把它认成视频（category != video）——**这是硬信号**：夸克只给
+//      video 转码，认成别的就只有原画一档。实测有一批 .mkv/.ts/.mp4 被标成
+//      image/png，`/file` streaming 直接回「21005 not video」。
+//   2. 扩展名是 .mkv——软信号，里面常是 HEVC/DTS-HD，浏览器解不了却不报错，
+//      只会黑屏一直下载。很多 mkv 其实能播，所以只用来排序，不用来拒绝。
 function risky(c) {
+  if (c.transcodable === false) return true;
   return /\.mkv$/i.test(c.name || '');
+}
+
+function riskyWhy(c) {
+  if (c.transcodable === false) return '网盘没认成视频，只有原画一档';
+  if (/\.mkv$/i.test(c.name || '')) return 'mkv 常是 HEVC/DTS-HD，浏览器可能解不了';
+  return '';
 }
 
 function renderSources(active) {
@@ -2128,10 +2139,9 @@ function renderSources(active) {
     const b = el('button', 'sbtn' + (c.path === active ? ' active' : '')
                            + (risky(c) ? ' risky' : ''));
     b.textContent = copyLabel(c);
-    b.title = risky(c)
-      ? c.name + `
-（mkv 常是 HEVC/DTS-HD，浏览器可能解不了）`
-      : c.name;
+    const why = riskyWhy(c);
+    b.title = why ? c.name + `
+（` + why + `）` : c.name;
     b.onclick = () => switchSource(c);
     box.appendChild(b);
   }
@@ -2307,11 +2317,17 @@ function undecodable(data, s) {
     return;
   }
   hint.className = 'error';
+  // 「没有转码档」本身也分两种，说清楚才知道下一步该干嘛
+  const cur = curCopies.find(c => c.path === curPath);
+  const notVideo = cur && cur.transcodable === false;
   hint.textContent = '浏览器解不了这一档（' + s.label
     + '：原盘 MKV / HEVC / DTS-HD 音轨都属于这种，已停止后台下载）。'
     + (data.has_transcode ? '点上面的转码档即可正常播放。'
-                          : '该文件没有转码档，请用 mediafans play <文件> 调外部播放器，'
-                            + '或在剧集页点「转存全部版本」多存几个版本再换。');
+       : notVideo
+         ? '这个文件网盘没认成视频（多半是上传时伪装过类型），所以压根没转码档。'
+           + '换一个来源，或在作品页点「全部 N 版」多存几个版本。'
+         : '该文件没有转码档，请用 mediafans play <文件> 调外部播放器，'
+           + '或在作品页点「全部 N 版」多存几个版本再换。');
 }
 
 function slowLoading(s) {

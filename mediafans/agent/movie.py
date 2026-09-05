@@ -27,6 +27,7 @@ from .series import (
     SeriesView,
     SourceFile,
     _share_path,
+    copy_rank,
     multi_search,
 )
 
@@ -91,8 +92,9 @@ def scan_local_movie(drive, path: str, work: Work,
             continue
         info = parse_episode(f.name)      # 只为了拿分辨率/来源标签，集号不用
         out.append(LocalFile(path=f"{path.rstrip('/')}/{f.name}", name=f.name,
-                             size=f.size, height=info.height, source=info.source))
-    out.sort(key=lambda c: (-c.height, -c.size))
+                             size=f.size, height=info.height, source=info.source,
+                             category=f.category))
+    out.sort(key=copy_rank)
     return out
 
 
