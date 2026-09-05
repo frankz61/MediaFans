@@ -1286,8 +1286,9 @@ def test_page_can_switch_between_tv_and_movie_lists():
     assert "正在上映" in PAGE_HTML and "即将上映" in PAGE_HTML
     # 电影卡片也进详情页，不再只有「自动找片」一条路
     assert "card.onclick = () => openSeries(it);" in PAGE_HTML
-    # 详情页对电影换措辞
-    assert "isMovie ? '找资源' : '找缺失的集'" in PAGE_HTML
+    # 详情页对电影换措辞。文案只有 scanLabel() 一个出处——
+    # 以前 renderEpisodes 和出错分支各写各的，电影页一报错按钮就改了名
+    assert "'找资源' : '找缺失的集'" in _js_fn("scanLabel")
 
 
 def test_inline_javascript_parses(tmp_path):
