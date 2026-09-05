@@ -42,10 +42,9 @@ COOKIE_HELP = (
 # errno -> 人话（来自 baiduwp-php / hxz393 的错误表 + OpenList 黑名单错误码）
 _ERRNO_MSG = {
     -12: "提取码错误",
-    -9: "分享链接已失效（网页端打不开）",
     4: "文件已转存过",
     200025: "转存被拒（BDCLND 校验不过，通常是分享在网页端已失效）",
-    -130: "分享内容已被删除或失效",
+    -130: "内容已被删除（fileNums=0）",
     -9: "分享不存在或已失效",
     -8: "目标目录已有同名文件",
     -7: "文件名含非法字符",
@@ -90,7 +89,8 @@ def _restore_sekey(sekey: str) -> str:
 def _errno_msg(errno, body: dict) -> str:
     extra = ""
     if isinstance(body, dict):
-        extra = str(body.get("show_msg") or body.get("errmsg") or body.get("errtype") or "")
+        # errtype 是个数字分类码（1/3…），拼进去只会变成「分享已失效: 1」
+        extra = str(body.get("show_msg") or body.get("errmsg") or "")
     base = _ERRNO_MSG.get(errno) or f"errno={errno}"
     return f"{base}（{extra}）" if extra and extra not in base else base
 
@@ -411,11 +411,12 @@ class BaiduDrive(BaseDrive):
         errno = resp.get("errno")
         if errno in (0, None):
             return resp
-        msg = str(resp.get("show_msg") or resp.get("errtype") or "")
-        if "mispw" in msg or errno in (-9, -12, 5):
-            raise DriveError(f"提取码错误或缺失: {msg or _errno_msg(errno, resp)}")
-        if "mis_" in msg or errno in (105, 10, 116, -4, 3, 0, -130):
-            raise DriveError(f"分享已失效或不可访问: {msg or _errno_msg(errno, resp)}")
+        # errtype 只用来分类，展示一律走 _errno_msg
+        kind = str(resp.get("show_msg") or "") + "|" + str(resp.get("errtype") or "")
+        if "mispw" in kind or errno in (-9, -12, 5):
+            raise DriveError(f"提取码错误或缺失: {_errno_msg(errno, resp)}")
+        if "mis_" in kind or errno in (105, 10, 116, -4, 3, 0, -130):
+            raise DriveError(f"分享已失效: {_errno_msg(errno, resp)}")
         raise DriveError(f"打开百度分享失败: {_errno_msg(errno, resp)}")
 
     def list_share_files(self, ctx: ShareContext, dir_fid: str = "0") -> List[DriveFile]:

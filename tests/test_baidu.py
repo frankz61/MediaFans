@@ -578,3 +578,28 @@ def test_transfer_errno_4_is_not_a_failure():
                        extra={"shareid": "1", "uk": "2", "sekey": "S"})
     got = drive.save_share_files(ctx, [DriveFile(fid="9", name="E01.mkv")], "/d")
     assert got == ["5"]
+
+
+def test_errno_table_has_no_duplicate_keys():
+    """dict 字面量里键重复不会报错，后写的静默覆盖先写的——这个坑踩过一次。
+
+    往表里插新错误码时很容易插到已有的同号前面，然后「改了没生效」，
+    而代码看起来完全正常。运行期的 dict 已经看不出来了，得回去读源码。
+    """
+    import ast
+    import pathlib
+
+    import mediafans.drive.baidu as mod
+
+    tree = ast.parse(pathlib.Path(mod.__file__).read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(getattr(t, "id", "") == "_ERRNO_MSG" for t in node.targets):
+            continue
+        keys = [ast.literal_eval(k) for k in node.value.keys]
+        dupes = {k for k in keys if keys.count(k) > 1}
+        assert not dupes, f"_ERRNO_MSG 里有重复错误码: {sorted(dupes)}"
+        break
+    else:
+        raise AssertionError("没找到 _ERRNO_MSG")
