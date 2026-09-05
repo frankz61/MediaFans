@@ -965,6 +965,8 @@ def test_baidu_share_save_play_stream(upstream_url, tmp_path):
 
     def handler(request):
         p = request.url.path
+        if p == "/share/list":
+            return httpx.Response(200, json={"errno": 0, "list": [{"fs_id": 1}]})
         if p == "/share/wxlist":
             state["wxlist"] = {k: v[0] for k, v in
                                parse_qs(request.content.decode()).items()}

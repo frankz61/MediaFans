@@ -240,6 +240,9 @@ def test_open_share_and_list(tmp_path):
 
     def handler(request):
         p = request.url.path
+        if p == "/share/list":       # 网页通道存活检查
+            assert "BDCLND=" in request.headers.get("cookie", "")
+            return httpx.Response(200, json={"errno": 0, "list": [{"fs_id": 1}]})
         if p == "/share/wxlist":
             assert request.headers["user-agent"] == "netdisk"
             assert "BDUSS=x" in request.headers.get("cookie", "")
@@ -394,7 +397,7 @@ def test_share_seckey_is_urlsafe_base64():
                 "shareid": 1, "uk": 2,
                 "seckey": "DYKHGNNTJ2bBWJZUHF1yTzF30mdc6cJ_ekw6EYofXd8~",
                 "list": []}})
-        return httpx.Response(200, json={"errno": 0})
+        return httpx.Response(200, json={"errno": 0, "list": [{"fs_id": 1}]})
 
     drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=y"},
                        transport=httpx.MockTransport(handler))
@@ -505,3 +508,73 @@ def test_check_transfer_ready_is_a_noop_by_default():
     from mediafans.drive.base import BaseDrive
 
     BaseDrive({}).check_transfer_ready()
+
+
+def test_share_alive_on_wxlist_but_dead_on_web_is_rejected():
+    """wxlist 会对失效分享继续返回完整数据，转存时才炸成 200025。
+
+    实测一次搜索的 14 条结果：wxlist 放行 4 条，其中 2 条 `share/list` 报 -9，
+    转存全部失败。所以打开分享时就得用转存那条通道确认一次，否则「验证通过」
+    是假的——用户看到 3 个资源可用，一键转存下去有 2 个转不动。
+    """
+    from mediafans.errors import DriveError
+
+    def handler(request):
+        if request.url.path == "/share/wxlist":
+            return httpx.Response(200, json={"errno": 0, "data": {
+                "shareid": 1, "uk": 2, "seckey": "SK~",
+                "list": [{"fs_id": 9, "server_filename": "E01.mkv", "isdir": 0}]}})
+        if request.url.path == "/share/list":
+            return httpx.Response(200, json={"errno": -9, "list": []})
+        return httpx.Response(200, json={"errno": 0})
+
+    drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=y"},
+                       transport=httpx.MockTransport(handler))
+    with pytest.raises(DriveError, match="失效"):
+        drive.open_share("https://pan.baidu.com/s/1abcdefg", "pwd1")
+
+
+def test_liveness_check_needs_no_bdstoken():
+    """存活检查不能依赖登录态：浏览和探测在登录过期时也该照常能用."""
+    seen = {}
+
+    def handler(request):
+        p = request.url.path
+        if p == "/share/wxlist":
+            return httpx.Response(200, json={"errno": 0, "data": {
+                "shareid": 1, "uk": 2, "seckey": "SK~", "list": []}})
+        if p == "/share/list":
+            seen["params"] = dict(request.url.params)
+            return httpx.Response(200, json={"errno": 0, "list": [{"fs_id": 1}]})
+        if p == "/api/gettemplatevariable":
+            raise AssertionError("存活检查不该去问 bdstoken")
+        return httpx.Response(200, json={"errno": 0})
+
+    drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=y"},
+                       transport=httpx.MockTransport(handler))
+    drive.open_share("https://pan.baidu.com/s/1abcdefg", "pwd1")
+    assert "bdstoken" not in seen["params"]
+
+
+def test_transfer_errno_4_is_not_a_failure():
+    """4 =「文件已转存」：目标已经有了，不该让整批 40 集中断."""
+    def handler(request):
+        p = request.url.path
+        if p == "/share/transfer":
+            return httpx.Response(200, json={"errno": 4, "show_msg": "文件已转存"})
+        if p == "/api/gettemplatevariable":
+            return httpx.Response(200, json={"errno": 0, "result": {"bdstoken": "b" * 32}})
+        if p == "/api/list":
+            return httpx.Response(200, json={"errno": 0, "list": [
+                {"fs_id": 5, "server_filename": "E01.mkv", "isdir": 0, "path": "/d/E01.mkv"}]})
+        return httpx.Response(200, json={"errno": 0})
+
+    from mediafans.drive.base import ShareContext
+    from mediafans.models import DriveFile
+
+    drive = BaiduDrive({"cookie": "BDUSS=x; STOKEN=y"},
+                       transport=httpx.MockTransport(handler))
+    ctx = ShareContext(url="u", pwd_id="p", passcode="",
+                       extra={"shareid": "1", "uk": "2", "sekey": "S"})
+    got = drive.save_share_files(ctx, [DriveFile(fid="9", name="E01.mkv")], "/d")
+    assert got == ["5"]

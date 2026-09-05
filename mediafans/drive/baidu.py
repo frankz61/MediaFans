@@ -42,6 +42,9 @@ COOKIE_HELP = (
 # errno -> 人话（来自 baiduwp-php / hxz393 的错误表 + OpenList 黑名单错误码）
 _ERRNO_MSG = {
     -12: "提取码错误",
+    -9: "分享链接已失效（网页端打不开）",
+    4: "文件已转存过",
+    200025: "转存被拒（BDCLND 校验不过，通常是分享在网页端已失效）",
     -130: "分享内容已被删除或失效",
     -9: "分享不存在或已失效",
     -8: "目标目录已有同名文件",
@@ -160,13 +163,14 @@ class BaiduDrive(BaseDrive):
         return r
 
     def _web_api(self, method: str, path: str, *, params=None, data=None,
-                 ua: str = BROWSER_UA, bdclnd: str = "") -> dict:
+                 ua: str = BROWSER_UA, bdclnd: str = "", referer: str = "") -> dict:
         """网页端接口（cookie 鉴权）。bdclnd 是分享验证 sekey，转存时必须带."""
         if not self.cookie:
             raise ConfigError(COOKIE_HELP)
         cookie = merge_cookies(self.cookie, f"BDCLND={bdclnd}") if bdclnd else self.cookie
         r = self._request(method, WEB + path, params=params, data=data,
-                          headers={"User-Agent": ua, "Referer": "https://pan.baidu.com/disk/home"},
+                          headers={"User-Agent": ua,
+                                   "Referer": referer or "https://pan.baidu.com/disk/home"},
                           cookie=cookie)
         try:
             body = r.json()
@@ -345,6 +349,8 @@ class BaiduDrive(BaseDrive):
         if not shareid or not sekey:
             raise DriveError("分享信息不完整（缺少 shareid/seckey），分享可能已失效")
         sekey = _restore_sekey(sekey)
+        if surl:
+            self._assert_web_channel(surl, sekey)
         return ShareContext(url=share_url, pwd_id=surl, passcode=code, extra={
             "surl": "1" + surl if surl else "",
             "legacy": legacy,       # {"uk":..,"shareid":..} 旧式链接
@@ -352,6 +358,30 @@ class BaiduDrive(BaseDrive):
             "uk": uk,
             "sekey": sekey,
         })
+
+    def _assert_web_channel(self, surl: str, sekey: str) -> None:
+        """确认网页通道也认这个分享——转存走的是网页通道，wxlist 不算数。
+
+        wxlist（微信通道）会对**已经失效的分享继续返回** shareid、seckey 和
+        完整文件列表，看起来一切正常。实测一次「异人之下」搜索的 14 条结果：
+        wxlist 放行 4 条，其中 2 条网页通道报 errno -9，转存时变成 200025
+        「提取码输入错误」——又一次跟提取码毫无关系。
+
+        `share/list` 是转存那条通道上最便宜的探针，而且**不需要 bdstoken**，
+        所以登录态过期时也能照常用来筛资源（浏览和探测本来就不该要登录态）。
+        4 个样本上 errno 0 ↔ 转存成功、errno -9 ↔ 200025，完全对应。
+
+        wxlist 自带的 `is_zombie` 指望不上：14 条里全是 0，包括已经死掉的。
+        """
+        body = self._web_api("GET", "/share/list", params={
+            "shorturl": surl, "dir": "/", "root": "1", "page": "1", "num": "1",
+            "order": "other", "desc": "1", "showempty": "0",
+            "web": "1", "clienttype": "0", "app_id": WEB_APP_ID, "channel": "chunlei",
+        }, bdclnd=sekey, referer=f"https://pan.baidu.com/s/1{surl}")
+        errno = body.get("errno")
+        if errno not in (0, None):
+            raise DriveError(
+                f"分享已失效（网页端打不开，转存也会失败）: {_errno_msg(errno, body)}")
 
     def _wxlist(self, *, surl: str = "", legacy: Optional[dict] = None,
                 code: str = "", root: bool = True, dir_path: str = "",
@@ -441,7 +471,9 @@ class BaiduDrive(BaseDrive):
                 bdclnd=ctx.extra.get("sekey", ""),
             )
             errno = resp.get("errno")
-            if errno not in (0, None):
+            # 4 =「文件已转存」：目标已经有了，这一批没新增而已，不是失败。
+            # 抛出去的话会让 40 集的批量任务因为一个早就存在的文件整组中断。
+            if errno not in (0, None, 4):
                 raise DriveError(f"百度转存失败: {_errno_msg(errno, resp)}")
         # transfer 不返回新 fs_id，转存后列目标目录拿（失败不影响结果，仅影响返回值）
         try:
