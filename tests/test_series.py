@@ -61,27 +61,32 @@ def test_scan_local_maps_episodes():
     ]})
     local = scan_local(drive, "/MediaFans/剧", 2)
     assert sorted(local) == [1, 2]
-    assert local[1].height == 2160 and local[2].height == 1080
-    assert local[1].path == "/MediaFans/剧/Silo.S02E01.2160p.WEB-DL.mkv"
+    assert local[1][0].height == 2160 and local[2][0].height == 1080
+    assert local[1][0].path == "/MediaFans/剧/Silo.S02E01.2160p.WEB-DL.mkv"
 
 
-def test_scan_local_dedupes_keeping_best_quality():
-    """同一集存了两份时保留画质更高的——用户网盘里 E07 就是这个情况."""
+def test_scan_local_keeps_every_copy_best_first():
+    """同一集存了两份时两份都留着，画质高的排前面。
+
+    以前这里只保留最好的那一份、其余当重复丢掉。但「最好」只是按分辨率和
+    体积猜的——播起来才知道原盘 MKV 浏览器解不了。留着全部，播放器才能
+    一键换一份，不用回去重新转存。
+    """
     drive = FakeDrive({"/MediaFans/剧": [
         _f("Silo.S02E07.1080p.WEB.h264.mkv", size=3 * 1024 ** 3),
         _f("Silo.S02E07.2160p.WEB-DL.H265.mkv", size=9 * 1024 ** 3),
     ]})
     local = scan_local(drive, "/MediaFans/剧", 2)
-    assert len(local) == 1
-    assert local[7].height == 2160
-    assert local[7].size == 9 * 1024 ** 3
+    assert len(local) == 1                      # 还是一集
+    assert [c.height for c in local[7]] == [2160, 1080]
+    assert local[7][0].size == 9 * 1024 ** 3
 
 
 def test_scan_local_filters_by_season():
     drive = FakeDrive({"/MediaFans/剧": [
         _f("Show.S01E01.1080p.mkv"), _f("Show.S02E01.1080p.mkv")]})
     assert sorted(scan_local(drive, "/MediaFans/剧", 2)) == [1]
-    assert scan_local(drive, "/MediaFans/剧", 2)[1].name.startswith("Show.S02")
+    assert scan_local(drive, "/MediaFans/剧", 2)[1][0].name.startswith("Show.S02")
 
 
 def test_scan_local_keeps_files_without_season_marker():

@@ -57,41 +57,43 @@ def movie_queries(title: str, original: str = "", year: str = "") -> List[str]:
 
 
 def scan_local_movie(drive, path: str, work: Work,
-                     foreign: Optional[List[str]] = None) -> Optional[LocalFile]:
-    """网盘目录里已经存着的这部片，挑画质体积最好的一个。
+                     foreign: Optional[List[str]] = None) -> List[LocalFile]:
+    """网盘目录里已经存着的这部片，**所有**副本，画质最好的排前面。
+
+    电影比剧集更需要留多份：同一部片的 4K 原盘、1080p WEB-DL、国语配音版
+    往往同时存在，而「哪个能播」要播了才知道（原盘 MKV 浏览器多半解不了）。
 
     跟剧集的 scan_local 相比少了集号这一维，于是**片名判断成了唯一的闸门**：
     一个目录里混进别的片子时，剧集那边还能靠集号对不上兜住，这里兜不住。
     所以同样先看目录里的命名是否带得动片名信号（titles_are_usable），
     带不动就不按片名拒——宁可多留，也不要把用户自己存的片判成「别人的」。
     """
+    from .episode import parse_episode
+
     try:
         fid = drive.resolve_path(path)
         if not fid:
-            return None
+            return []
         entries = drive.list_files(fid)
     except Exception:
-        return None
+        return []
 
     cand = [f for f in entries if not f.is_dir and is_playable(f.name)]
     if not cand:
-        return None
+        return []
     trust = titles_are_usable([f.name for f in cand], work.titles)
-    best: Optional[LocalFile] = None
+    out: List[LocalFile] = []
     for f in cand:
         why = belongs(f.name, work, trust_titles=trust, title_can_reject=True)
         if why:
             if foreign is not None:
                 foreign.append(f.name)
             continue
-        from .episode import parse_episode
-
         info = parse_episode(f.name)      # 只为了拿分辨率/来源标签，集号不用
-        pick = LocalFile(path=f"{path.rstrip('/')}/{f.name}", name=f.name,
-                         size=f.size, height=info.height, source=info.source)
-        if best is None or (pick.height, pick.size) > (best.height, best.size):
-            best = pick
-    return best
+        out.append(LocalFile(path=f"{path.rstrip('/')}/{f.name}", name=f.name,
+                             size=f.size, height=info.height, source=info.source))
+    out.sort(key=lambda c: (-c.height, -c.size))
+    return out
 
 
 def movie_sources(probes: List[ProbeResult], work: Work,
@@ -173,9 +175,10 @@ def build_movie(
     # 那边 `末日地堡2 E01.mkv` 里的 2 常常是季号。
     work = Work(titles=titles, animation=detail.get("animation"), strict_sequel=True)
     foreign: List[str] = []
-    row.local = scan_local_movie(drive, base, work, foreign)
-    step("local", "网盘里已经有了" if row.local else "网盘里还没有",
-         saved=1 if row.local else 0)
+    row.copies = scan_local_movie(drive, base, work, foreign)
+    step("local", (f"网盘里已经有 {len(row.copies)} 个版本" if len(row.copies) > 1
+                   else "网盘里已经有了" if row.copies else "网盘里还没有"),
+         saved=1 if row.copies else 0)
     if foreign:
         view.notes.append(
             f"这个目录里还有 {len(foreign)} 个文件不属于本片，已跳过"

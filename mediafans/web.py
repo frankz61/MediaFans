@@ -578,12 +578,22 @@ class WebApp:
 
         列出可播放文件的地方都带上，进度才在哪儿都看得见——
         不然用户得先点进去播一下才知道自己看没看过。
+
+        一集可能存了好几份（见 EpisodeRow.copies），进度是记在**具体文件**上的。
+        只看主副本的话，用户中途换过来源就会显示成「没看过」。所以每一份都查，
+        取最近更新的那条。
         """
         for ep in data.get("episodes", []):
-            loc = ep.get("local") or {}
-            w = self._mark_of(loc.get("path", ""), nd)
-            if w:
-                ep["watched"] = w
+            paths = [c.get("path", "") for c in (ep.get("copies") or [])]
+            if not paths and ep.get("local"):
+                paths = [ep["local"].get("path", "")]
+            marks = [m for m in (self.watch.get(self._watch_key(p, nd))
+                                 for p in paths if p) if m]
+            if marks:
+                m = max(marks, key=lambda x: x.updated)
+                ep["watched"] = {"percent": m.percent, "finished": m.finished,
+                                 "resume_at": m.resume_at, "position": m.position,
+                                 "duration": m.duration, "path": m.path}
         return data
 
     def api_watch_save(self, payload: dict) -> dict:
@@ -712,10 +722,54 @@ class WebApp:
         # 存完就地更新缓存，前端不用重新扫
         from .agent import LocalFile
 
-        row.local = LocalFile(path=path, name=src.file.name, size=src.file.size,
-                              height=src.file.height, source=src.file.source)
+        row.add_copy(LocalFile(path=path, name=src.file.name, size=src.file.size,
+                               height=src.file.height, source=src.file.source))
         self.series_cache.put((nd, tmdb_id, season), view)
         return {"path": path, "already": False, "name": src.file.name}
+
+    def api_episode_fetch_all(self, payload: dict) -> dict:
+        """把这一集（或这部片）能找到的版本都转存下来，供播放时切换。
+
+        开后台任务：一个来源就是一次「开分享 + 递归列目录 + 转存」，
+        转五个版本几十秒是常事，同步请求会顶到浏览器超时。
+        """
+        from .agent import LocalFile, fetch_all
+
+        tmdb_id = int(payload.get("tmdb_id") or 0)
+        is_movie = str(payload.get("media") or "tv") == "movie"
+        season = 0 if is_movie else int(payload.get("season") or 0)
+        episode = int(payload.get("episode") or 0)
+        nd = self._nd_of(payload.get("netdisk"))
+        view = self.series_cache.get((nd, tmdb_id, season))
+        if view is None:
+            raise MediaFansError("资源信息已过期，请重新扫描")
+        row = next((r for r in view.rows if r.episode == episode), None)
+        if row is None:
+            raise MediaFansError(f"没有第 {episode} 集")
+        if not row.sources:
+            raise MediaFansError("还没有找到来源，先点「找资源」")
+        self._drive_for(nd).check_transfer_ready()
+        sources = list(row.sources)
+        have = [c.name for c in row.copies]
+        local_dir = view.local_dir
+
+        def runner(on_step):
+            res = fetch_all(lambda: self._drive_for(nd), sources, local_dir,
+                            have=have, on_step=on_step)
+            # 存完就地补进缓存，前端不用重新扫一遍
+            live = self.series_cache.get((nd, tmdb_id, season)) or view
+            r = next((x for x in live.rows if x.episode == episode), None)
+            if r is not None:
+                for f in res["saved"]:
+                    r.add_copy(LocalFile(path=f["path"], name=f["name"],
+                                         size=f["size"], height=f["height"],
+                                         source=f["source"]))
+                self.series_cache.put((nd, tmdb_id, season), live)
+            out = self._attach_watch(live.as_dict(), nd)
+            out["fetched"] = res
+            return out
+
+        return {"job": self.jobs.start(runner)}
 
     def api_season_fetch(self, payload: dict) -> dict:
         """一键把这一季能补的集全补上。开后台任务，进度靠轮询。
@@ -985,6 +1039,8 @@ class WebApp:
                         self._json(200, app.api_watch_forget(self._body()))
                     elif parsed.path == "/api/season/fetch":
                         self._json(200, app.api_season_fetch(self._body()))
+                    elif parsed.path == "/api/episode/fetch/all":
+                        self._json(200, app.api_episode_fetch_all(self._body()))
                     elif parsed.path == "/api/episode/fetch":
                         self._json(200, app.api_episode_fetch(self._body()))
                     elif parsed.path == "/api/login/baidu":
@@ -1284,11 +1340,27 @@ PAGE_HTML = r"""<!doctype html>
           border-radius:5px; padding:2px 4px; font-size:12px; }
   #rate.fast { color:var(--accent); border-color:var(--accent); }
   #quality { display:flex; gap:8px; padding:8px 4px 0; flex-wrap:wrap; }
+  /* 「来源」和「画质档」是两回事：画质档是同一个文件的不同转码流，
+     来源是网盘里同一集的不同文件（4K 原盘 / 1080p WEB-DL / 国语版…）。
+     摆两排，别混成一排让人以为是同一维度。 */
+  #sources { display:none; gap:8px; padding:8px 4px 0; flex-wrap:wrap;
+             align-items:center; }
+  #sources.on { display:flex; }
+  #sources .lbl { color:var(--dim); font-size:12px; flex:none; }
+  #sources.warn .lbl { color:#ffc46b; }
+  .sbtn { background:#222836; color:var(--dim); border:1px solid var(--line);
+          border-radius:20px; padding:3px 14px; font-size:12px; cursor:pointer;
+          max-width:min(340px, 60vw); overflow:hidden; text-overflow:ellipsis;
+          white-space:nowrap; }
+  .sbtn:hover { color:var(--text); }
+  .sbtn.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .sbtn.risky { border-style:dashed; }
   .qbtn { background:#222836; color:var(--dim); border:1px solid var(--line);
           border-radius:20px; padding:3px 14px; font-size:12px; cursor:pointer; }
   .qbtn:hover { color:var(--text); }
   .qbtn.active { background:var(--accent); color:#fff; border-color:var(--accent); }
   .qbtn.unplayable { opacity:.5; text-decoration:line-through; }
+  .ep .pill.all { border-color:var(--accent); color:var(--accent); }
   #meta { padding:6px 4px 0; display:flex; align-items:baseline; gap:10px; }
   #meta .title { font-size:15px; font-weight:600; word-break:break-all; }
   #meta .sub { color:var(--dim); font-size:12px; }
@@ -1493,6 +1565,8 @@ PAGE_HTML = r"""<!doctype html>
     /* 播放器下方的信息区压缩，别把列表挤没了。
        清晰度和导航条原本会换行（实测各占两行、共 176px），改成横向滚动单行，
        文件列表的可见高度从 202px 涨到 300px 以上。 */
+    #sources { padding:6px 8px; flex-wrap:nowrap; overflow-x:auto; }
+    #sources > * { flex:none; white-space:nowrap; }
     #quality, #navbar { padding:6px 8px; flex-wrap:nowrap; overflow-x:auto;
                         scrollbar-width:none; }
     #quality::-webkit-scrollbar, #navbar::-webkit-scrollbar { display:none; }
@@ -1512,6 +1586,7 @@ PAGE_HTML = r"""<!doctype html>
        注意是压小不是 display:none —— 后者在部分浏览器上会把播放中断。 */
     body.tab-search #video { max-height:24vh; }
     body.tab-search #quality,
+    body.tab-search #sources,
     body.tab-search #navbar,
     body.tab-search #playlist,
     body.tab-search #meta,
@@ -1741,6 +1816,7 @@ PAGE_HTML = r"""<!doctype html>
       </div>
     </div>
     <div id="quality"></div>
+    <div id="sources"></div>
     <div id="navbar" style="display:none">
       <button id="prevBtn" onclick="playAdjacent(-1)">← 上一个</button>
       <button id="nextBtn" onclick="playAdjacent(1)">下一个 →</button>
@@ -2024,9 +2100,62 @@ function renderCrumb(path) {
   }
 }
 
+// ---------------- 来源切换 ----------------
+// 同一集在网盘里可能存了好几份（4K 原盘 / 1080p WEB-DL / 国语版…）。
+// 「哪一份能播」只有播起来才知道：原盘 MKV 浏览器多半解不了、直链可能被 CDN 拒。
+// 所以把所有副本摆出来，随时能换，换的时候接着当前进度播。
+let curCopies = [];
+
+function copyLabel(c) {
+  const bits = [c.height ? c.height + 'p' : '', c.size_h || '', c.source || ''];
+  return bits.filter(Boolean).join(' · ') || c.name;
+}
+
+// .mkv 装的常常是 HEVC/DTS-HD，浏览器解不了却又不报错，只会黑屏一直下载。
+// 不能据此拒绝（很多 mkv 是能播的），但换来源时优先挑不是 mkv 的那个。
+function risky(c) {
+  return /\.mkv$/i.test(c.name || '');
+}
+
+function renderSources(active) {
+  const box = $('#sources');
+  box.innerHTML = '';
+  box.classList.remove('on', 'warn');
+  if (curCopies.length < 2) return;      // 只有一份就没什么可切的
+  box.classList.add('on');
+  box.appendChild(el('span', 'lbl', '来源'));
+  for (const c of curCopies) {
+    const b = el('button', 'sbtn' + (c.path === active ? ' active' : '')
+                           + (risky(c) ? ' risky' : ''));
+    b.textContent = copyLabel(c);
+    b.title = risky(c)
+      ? c.name + `
+（mkv 常是 HEVC/DTS-HD，浏览器可能解不了）`
+      : c.name;
+    b.onclick = () => switchSource(c);
+    box.appendChild(b);
+  }
+}
+
+// 换来源 = 换文件，但还是同一集：接着当前进度播，剧集上下文原样留着
+function switchSource(c) {
+  if (c.path === curPath) return;
+  const at = video.currentTime || 0;
+  if (playCtx) playCtx.path = c.path;    // 进度要记到新文件上
+  playFile({ path: c.path, name: c.name, size_h: c.size_h, nd: curPlayNd,
+             keepCtx: true, startAt: at, copies: curCopies });
+}
+
+// 当前这份播不了时，换哪一份最有指望：优先不是 mkv 的，其次画质次一档的
+function nextBestCopy() {
+  const others = curCopies.filter(c => c.path !== curPath);
+  return others.find(c => !risky(c)) || others[0] || null;
+}
+
 async function playFile(f) {
   // 从目录/播放列表点开的是散片，把剧集上下文清掉，免得进度记到别的剧上
   if (!f.keepCtx) playCtx = null;
+  curCopies = f.copies || [];
   curPlayNd = f.nd || curNd;
   const hint = $('#hint');
   hint.className = ''; hint.textContent = '获取直链…';
@@ -2040,6 +2169,7 @@ async function playFile(f) {
     curPath = f.path;
     const pick = chooseStream(data);
     renderQuality(data, pick);
+    renderSources(f.path);
     const at = f.startAt !== undefined ? f.startAt : await resumePos(f.path);
     playStream(data, pick, at);
     renderNav(f);
@@ -2164,11 +2294,24 @@ function undecodable(data, s) {
     try { localStorage.removeItem('mf_quality'); } catch (e) {}  // 别让这一档粘住
   }
   const hint = $('#hint');
+  // 这一档确定解不了，而网盘里还存着这一集的别的版本 —— 直接换过去，
+  // 不用让用户先看懂「HEVC/DTS-HD」再自己去点。没有转码档时尤其只有这一条路。
+  const alt = nextBestCopy();
+  if (alt) {
+    hint.className = '';
+    hint.textContent = '浏览器解不了这个文件（' + s.label
+      + '：原盘 MKV / HEVC / DTS-HD 都属于这种），已自动换到「'
+      + copyLabel(alt) + '」。';
+    $('#sources').classList.add('warn');
+    switchSource(alt);
+    return;
+  }
   hint.className = 'error';
   hint.textContent = '浏览器解不了这一档（' + s.label
     + '：原盘 MKV / HEVC / DTS-HD 音轨都属于这种，已停止后台下载）。'
     + (data.has_transcode ? '点上面的转码档即可正常播放。'
-                          : '该文件没有转码档，请用 mediafans play <文件> 调外部播放器。');
+                          : '该文件没有转码档，请用 mediafans play <文件> 调外部播放器，'
+                            + '或在剧集页点「转存全部版本」多存几个版本再换。');
 }
 
 function slowLoading(s) {
@@ -2180,11 +2323,15 @@ function slowLoading(s) {
 }
 
 function stalled(s) {
-  // 只提示，不掐流：慢也可能只是这会儿网差，让它自己continue
+  // 只提示，不掐流：慢也可能只是这会儿网差，让它自己 continue。
+  // 但这时候「换个来源」往往比等更有用，所以把来源栏标黄提示一下。
   const hint = $('#hint');
   hint.className = 'error';
+  const alt = nextBestCopy();
   hint.textContent = s.label + ' 迟迟没有数据，可能是直链过期或网络问题。'
-    + '重新点一次文件可重取直链；仍不行就换低一档试试。';
+    + '重新点一次文件可重取直链；仍不行就换低一档'
+    + (alt ? '，或点下面「来源」换成「' + copyLabel(alt) + '」。' : '试试。');
+  if (alt) $('#sources').classList.add('warn');
 }
 
 function switchQuality(data, s, btn) {
@@ -3123,6 +3270,11 @@ async function openSeriesAt(mark, episode) {
   // 电影只有一行，「下一集」这个概念不存在，永远回到那一行
   if (media === 'movie') episode = (d.episodes[0] || {}).episode;
   const ep = (d.episodes || []).find(e => e.episode === episode);
+  // 上次看的是哪一份就接着那一份：一集存了多份时，主副本不一定是用户在看的
+  if (ep && ep.copies && mark.play_path) {
+    const same = ep.copies.find(c => c.path === mark.play_path);
+    if (same) { playEpisode(d, ep, undefined, same); return; }
+  }
   if (ep && ep.local) playEpisode(d, ep);
   else if (ep) {
     const row = $('#ep-' + episode);
@@ -3203,8 +3355,9 @@ function renderEpisodes(d) {
 function epRow(d, ep) {
   const w = ep.watched;
   const isMovie = d.media_type === 'movie';
+  const playingHere = !!curPath && (ep.copies || []).some(c => c.path === curPath);
   const row = el('div', 'ep ' + ep.status + (w && w.finished ? ' done' : '')
-                 + (curPath && ep.local && ep.local.path === curPath ? ' playing' : ''));
+                 + (playingHere ? ' playing' : ''));
   row.id = 'ep-' + ep.episode;
   row.appendChild(el('span', 'no', isMovie ? '影片'
                                            : 'E' + String(ep.episode).padStart(2, '0')));
@@ -3212,8 +3365,11 @@ function epRow(d, ep) {
   body.appendChild(el('div', 'name',
                       ep.title || (isMovie ? d.title : '第 ' + ep.episode + ' 集')));
   const bits = [];
+  const nCopies = (ep.copies || []).length;
   if (ep.local) {
     bits.push((ep.local.height ? ep.local.height + 'p · ' : '') + ep.local.size_h);
+    // 存了不止一份就说清楚：播放时能在这几份之间切
+    if (nCopies > 1) bits.push('已存 ' + nCopies + ' 个版本，播放时可切换');
   } else if (ep.sources.length) {
     bits.push(ep.sources.length + (isMovie ? ' 个版本可转存' : ' 个来源可补'));
   } else {
@@ -3238,7 +3394,18 @@ function epRow(d, ep) {
                  w && !w.finished && w.resume_at ? '继续' : (w && w.finished ? '重看' : '播放'));
     b.onclick = () => playEpisode(d, ep);
     act.appendChild(b);
-  } else {
+  }
+  // 有多个来源就给「全部」：先各存一份，播不了的时候一键换，
+  // 不用回来重新找资源。已经存过的会按文件名跳过。
+  if (ep.sources.length > 1) {
+    const n = Math.min(ep.sources.length, COPY_CAP);
+    const b = el('button', 'pill all', '全部 ' + n + ' 版');
+    b.title = '把这' + (isMovie ? '部片' : '集') + '的 ' + n
+              + ' 个版本都转存下来，播放时可随时切换';
+    b.onclick = () => fetchAllSources(d, ep, b);
+    act.appendChild(b);
+  }
+  if (!ep.local) {
     for (const src of ep.sources.slice(0, isMovie ? 5 : 3)) {
       const b = el('button', 'pill src',
                    src.label + (src.height ? ' ' + src.height + 'p' : ''));
@@ -3250,6 +3417,66 @@ function epRow(d, ep) {
   }
   row.appendChild(act);
   return row;
+}
+
+// 一集最多留几份。跟后端 agent/series.py 的 DEFAULT_COPY_CAP 必须一致，
+// 有测试钉住，别单独改一边。
+const COPY_CAP = 5;
+
+// 把这一集/这部片能找到的版本都转存下来。为什么值得：「哪一份能播」只有
+// 播起来才知道（原盘 MKV 解不了、直链被拒、某版没中文字幕），事后再回来
+// 重新找资源很折腾。转存是秒传，占的是网盘配额不是上传时间。
+function fetchAllSources(d, ep, btn) {
+  const was = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '转存中…';
+  $('#scanLog').textContent = '';
+  clearInterval(seriesJobTimer);
+  fetch('/api/episode/fetch/all', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ tmdb_id: d.tmdb_id, season: d.season,
+                           media: d.media_type || 'tv', episode: ep.episode,
+                           netdisk: curNd })
+  }).then(r => r.json()).then(j => {
+    if (j.error) throw new Error(j.error);
+    let shown = 0;
+    seriesJobTimer = setInterval(async () => {
+      const st = await (await fetch('/api/auto/status?job='
+                                    + encodeURIComponent(j.job))).json();
+      for (const step of (st.steps || []).slice(shown)) {
+        $('#scanLog').appendChild(el('div', null, '· ' + step.message));
+        $('#scanLog').scrollTop = $('#scanLog').scrollHeight;
+      }
+      shown = (st.steps || []).length;
+      if (!st.done) return;
+      clearInterval(seriesJobTimer);
+      btn.disabled = false;
+      btn.textContent = was;
+      if (st.error) {
+        reportError(st.error, curNd);
+        $('#scanLog').appendChild(el('div', null, '✗ ' + st.error));
+        return;
+      }
+      series.data = st.result;
+      renderSeasons(st.result);
+      renderEpisodes(st.result);
+      // 正在播的就是这一集的话，把新存下来的版本直接补进来源栏
+      const fresh = (st.result.episodes || []).find(x => x.episode === ep.episode);
+      if (fresh && curCopies.length && fresh.copies) {
+        curCopies = fresh.copies;
+        renderSources(curPath);
+      }
+      for (const e of (st.result.fetched || {}).errors || []) {
+        $('#scanLog').appendChild(el('div', null, '· ' + e));
+        reportError(e, curNd);
+      }
+    }, 900);
+  }).catch(e => {
+    btn.disabled = false;
+    btn.textContent = was;
+    reportError(e.message, curNd);
+    $('#scanLog').textContent = '启动失败：' + e.message;
+  });
 }
 
 async function fetchEpisode(d, ep, src, btn) {
@@ -3273,13 +3500,14 @@ async function fetchEpisode(d, ep, src, btn) {
 }
 
 // 播这一集。带上剧集上下文，进度才能记成「末日地堡 S02E08」而不是一个孤零零的路径。
-function playEpisode(d, ep, startAt) {
+function playEpisode(d, ep, startAt, copy) {
   const show = seriesShow || {};
   const isMovie = d.media_type === 'movie';
+  const use = copy || ep.local;      // copy：指定播这一集的哪一份
   // 电影的季/集留空：不是「第 0 季第 1 集」，是根本没有这个维度。
   // 「最近观看」靠这个决定显示成「第 2 季 第 8 集」还是就一个片名。
   playCtx = {
-    path: ep.local.path,
+    path: use.path,
     tmdb_id: d.tmdb_id, season: isMovie ? null : d.season,
     episode: isMovie ? null : ep.episode,
     meta: { tmdb_id: d.tmdb_id, media_type: isMovie ? 'movie' : 'tv',
@@ -3287,10 +3515,10 @@ function playEpisode(d, ep, startAt) {
             title: show.title || d.title || '', year: show.year || d.year || '',
             poster: show.poster || d.poster || '',
             ep_title: isMovie ? '' : (ep.title || ''),
-            name: ep.local.name, size_h: ep.local.size_h },
+            name: use.name, size_h: use.size_h },
   };
-  const f = { path: ep.local.path, name: ep.local.name, size_h: ep.local.size_h,
-              keepCtx: true };
+  const f = { path: use.path, name: use.name, size_h: use.size_h,
+              keepCtx: true, copies: ep.copies || [] };
   if (startAt !== undefined) f.startAt = startAt;
   return playFile(f).then(() => { if (series && series.data) renderEpisodes(series.data); });
 }

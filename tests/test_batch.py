@@ -202,3 +202,95 @@ def test_progress_is_reported_per_source():
     fetch_batch(lambda: drive, plan_batch(rows), "/d",
                 on_step=lambda stage, info: steps.append(info["message"]))
     assert sum(1 for m in steps if "转存" in m) >= 2
+
+
+# ---------------------------------------------------------------- 多版本转存
+class MultiDrive:
+    """按分享 URL 给不同文件列表的假网盘（fetch_all 要跨多个来源转存）."""
+
+    def __init__(self, files, dead=()):
+        self.files = files            # url -> [DriveFile]
+        self.dead = set(dead)
+        self.saves = []
+
+    def resolve_path(self, path):
+        return "fid:dir"
+
+    def list_files(self, fid):
+        return []
+
+    def open_share(self, url, passcode=""):
+        if url in self.dead:
+            raise RuntimeError("分享已失效")
+        return {"url": url}
+
+    def list_share_files(self, ctx, dir_fid="0"):
+        return list(self.files.get(ctx["url"], []))
+
+    def save_share_files(self, ctx, files, to_dir):
+        self.saves.append([f.name for f in files])
+        return [f.fid for f in files]
+
+
+def _df(name, fid):
+    return DriveFile(fid=fid, name=name, is_dir=False, size=1, share_fid_token="t")
+
+
+def _one(url, name, fid, height=1080):
+    return SourceFile(share_title=url, share_url=url, passcode="",
+                      file=ProbeFile(fid=fid, name=name, size=1,
+                                     share_fid_token="t", episode=1, height=height))
+
+
+def test_fetch_all_saves_every_version():
+    """存多份的意义：「哪一份能播」只有播起来才知道，事后重新找资源很折腾."""
+    from mediafans.agent import fetch_all
+
+    drive = MultiDrive({"s1": [_df("E01.2160p.mkv", "a"), _df("E01.1080p.mp4", "b")]})
+    srcs = [_one("s1", "E01.2160p.mkv", "a", 2160), _one("s1", "E01.1080p.mp4", "b")]
+    res = fetch_all(lambda: drive, srcs, "/MediaFans/剧")
+    assert [x["name"] for x in res["saved"]] == ["E01.2160p.mkv", "E01.1080p.mp4"]
+    assert res["errors"] == []
+    assert [x["path"] for x in res["saved"]] == [
+        "/MediaFans/剧/E01.2160p.mkv", "/MediaFans/剧/E01.1080p.mp4"]
+
+
+def test_fetch_all_skips_what_is_already_there():
+    """按文件名跳过：同名再转一次只会撞「已存在」."""
+    from mediafans.agent import fetch_all
+
+    drive = MultiDrive({"s1": [_df("E01.1080p.mp4", "b")]})
+    res = fetch_all(lambda: drive, [_one("s1", "E01.1080p.mp4", "b")],
+                    "/MediaFans/剧", have=["E01.1080p.mp4"])
+    assert res["saved"] == [] and res["skipped"] == ["E01.1080p.mp4"]
+    assert drive.saves == []
+
+
+def test_fetch_all_keeps_going_after_one_source_fails():
+    """十个来源里挂两个是常态，为此放弃另外八个没道理."""
+    from mediafans.agent import fetch_all
+
+    drive = MultiDrive({"ok": [_df("E01.1080p.mp4", "b")]}, dead=["dead"])
+    srcs = [_one("dead", "E01.2160p.mkv", "a", 2160), _one("ok", "E01.1080p.mp4", "b")]
+    res = fetch_all(lambda: drive, srcs, "/MediaFans/剧")
+    assert [x["name"] for x in res["saved"]] == ["E01.1080p.mp4"]
+    assert len(res["errors"]) == 1 and "E01.2160p.mkv" in res["errors"][0]
+
+
+def test_fetch_all_respects_the_cap():
+    """一部热门电影能搜出十几个版本，全转下来既占配额也让切换列表没法用."""
+    from mediafans.agent import DEFAULT_COPY_CAP, fetch_all
+
+    n = DEFAULT_COPY_CAP + 3
+    drive = MultiDrive({"s1": [_df(f"E01.v{i}.mp4", f"f{i}") for i in range(n)]})
+    srcs = [_one("s1", f"E01.v{i}.mp4", f"f{i}") for i in range(n)]
+    res = fetch_all(lambda: drive, srcs, "/MediaFans/剧")
+    assert len(res["saved"]) == DEFAULT_COPY_CAP
+
+
+def test_page_copy_cap_matches_the_backend():
+    """前端的 COPY_CAP 是硬写的，跟后端漂了就会显示「全部 8 版」却只存 5 个."""
+    from mediafans.agent import DEFAULT_COPY_CAP
+    from mediafans.web import PAGE_HTML
+
+    assert f"const COPY_CAP = {DEFAULT_COPY_CAP};" in PAGE_HTML

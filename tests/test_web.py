@@ -1310,3 +1310,61 @@ def test_inline_javascript_parses(tmp_path):
     f.write_text(js, encoding="utf-8")
     r = subprocess.run([node, "--check", str(f)], capture_output=True, text=True)
     assert r.returncode == 0, r.stderr[:600]
+
+
+# ---------------------------------------------------------------- 多副本
+def test_watch_progress_follows_the_copy_you_actually_played(tmp_path, upstream_url):
+    """一集存了多份时，进度记在具体文件上——只看主副本会显示成「没看过」。"""
+    from mediafans.agent import EpisodeRow, LocalFile, SeriesView
+    from mediafans.watch import WatchStore
+
+    app = make_webapp(upstream_url)
+    app.watch = WatchStore(tmp_path / "w.json")
+    row = EpisodeRow(episode=1, title="第1集")
+    row.copies = [LocalFile(path="/d/E01.2160p.mkv", name="a", size=9, height=2160),
+                  LocalFile(path="/d/E01.1080p.mp4", name="b", size=3, height=1080)]
+    view = SeriesView(tmdb_id=1, title="剧", season=1, seasons=[], rows=[row])
+
+    # 用户看的是第二份（主副本是 4K 那个，浏览器解不了才换过来的）
+    app.api_watch_save({"path": "/d/E01.1080p.mp4", "position": 900, "duration": 3000})
+    got = app._attach_watch(view.as_dict())
+    assert got["episodes"][0]["watched"]["path"] == "/d/E01.1080p.mp4"
+    assert got["episodes"][0]["watched"]["percent"] == 30
+    app.stop()
+
+
+def test_series_json_carries_every_copy(upstream_url):
+    from mediafans.agent import EpisodeRow, LocalFile, SeriesView
+
+    row = EpisodeRow(episode=1)
+    row.copies = [LocalFile(path="/d/a.mkv", name="a.mkv", size=9, height=2160),
+                  LocalFile(path="/d/b.mp4", name="b.mp4", size=3, height=1080)]
+    d = SeriesView(tmdb_id=1, title="剧", season=1, seasons=[], rows=[row]).as_dict()
+    ep = d["episodes"][0]
+    assert ep["status"] == "saved"
+    assert ep["local"]["name"] == "a.mkv"                 # 主副本还是最好的那个
+    assert [c["name"] for c in ep["copies"]] == ["a.mkv", "b.mp4"]
+
+
+def test_fetch_all_needs_sources_first(upstream_url):
+    from mediafans.agent import EpisodeRow, SeriesView
+    from mediafans.errors import MediaFansError
+
+    app = make_webapp(upstream_url)
+    view = SeriesView(tmdb_id=7, title="剧", season=1, seasons=[],
+                      rows=[EpisodeRow(episode=1)])
+    app.series_cache.put(("quark", 7, 1), view)
+    with pytest.raises(MediaFansError, match="还没有找到来源"):
+        app.api_episode_fetch_all({"tmdb_id": 7, "season": 1, "episode": 1})
+    app.stop()
+
+
+def test_page_can_switch_sources_while_playing():
+    from mediafans.web import PAGE_HTML
+
+    assert 'id="sources"' in PAGE_HTML and "function switchSource" in PAGE_HTML
+    # 换来源要接着当前进度播，而不是从头开始
+    assert "const at = video.currentTime || 0;" in PAGE_HTML
+    # 解不了这个文件时自动换一份，别让用户先看懂 HEVC/DTS-HD 再自己点
+    assert "const alt = nextBestCopy();" in PAGE_HTML
+    assert "已自动换到" in PAGE_HTML

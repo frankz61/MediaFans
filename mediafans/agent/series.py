@@ -70,12 +70,37 @@ class SourceFile:
 
 @dataclass
 class EpisodeRow:
+    """一集（电影就是唯一那一行）。
+
+    `copies` 是网盘里这一集的**所有**副本，最好的排在最前。一集存多份是有用的：
+    原盘 MKV 浏览器解不了、某个直链被 CDN 拒了、某一版没有中文字幕——
+    这些都只有播起来才知道，那时候能一键换一份比重新去转存强得多。
+
+    `local` 仍然是「主副本」（copies[0]），下游那十几处只关心「有没有」的
+    地方就不用跟着改。
+    """
+
     episode: int
     title: str = ""
     air_date: str = ""
     still: str = ""
-    local: Optional[LocalFile] = None
+    copies: List[LocalFile] = field(default_factory=list)
     sources: List[SourceFile] = field(default_factory=list)
+
+    @property
+    def local(self) -> Optional[LocalFile]:
+        return self.copies[0] if self.copies else None
+
+    @local.setter
+    def local(self, f: Optional[LocalFile]) -> None:
+        self.copies = [f] if f else []
+
+    def add_copy(self, f: LocalFile) -> None:
+        """新转存下来的一份。同名的算同一份，按画质体积重排."""
+        if any(c.path == f.path for c in self.copies):
+            return
+        self.copies.append(f)
+        self.copies.sort(key=lambda c: (-c.height, -c.size))
 
     @property
     def status(self) -> str:
@@ -93,6 +118,7 @@ class EpisodeRow:
             "still": self.still,
             "status": self.status,
             "local": self.local.as_dict() if self.local else None,
+            "copies": [c.as_dict() for c in self.copies],
             "sources": [s.as_dict(i) for i, s in enumerate(self.sources)],
         }
 
@@ -179,15 +205,19 @@ class SeriesCache:
 def scan_local(drive, path: str, season: Optional[int],
                titles: Optional[List[str]] = None,
                foreign: Optional[List[str]] = None,
-               work: Optional[Work] = None) -> Dict[int, LocalFile]:
-    """扫网盘目录，按集号归位。同一集存了多份时保留画质最高、体积最大的那个。
+               work: Optional[Work] = None) -> Dict[int, List[LocalFile]]:
+    """扫网盘目录，按集号归位。**同一集的多份全都留着**，画质最高的排前面。
+
+    以前这里只保留最好的那一份，其余当重复丢掉。但「最好」只是按分辨率和体积
+    猜的，播起来才知道原盘 MKV 浏览器解不了、某个直链被拒、某一版没中文字幕。
+    留着全部，播放器就能一键换一份，不用回去重新转存。
 
     只按集号归位是不够的：实测某个「末日地堡」目录里混进了
     `The.Gentlemen.2024.S01E01~E08`，第一季因此被凑成「已存 10 集」，
     点播放会放出另一部剧。判断一个文件是不是这部作品的，见 identity.py。
     传入 foreign 列表可以收集被判为其它作品的文件名（调用方自己持有，并发安全）。
     """
-    out: Dict[int, LocalFile] = {}
+    out: Dict[int, List[LocalFile]] = {}
     try:
         fid = drive.resolve_path(path)
         if not fid:
@@ -220,11 +250,11 @@ def scan_local(drive, path: str, season: Optional[int],
             if foreign is not None:
                 foreign.append(f.name)
             continue
-        cur = out.get(info.episode)
-        pick = LocalFile(path=f"{path.rstrip('/')}/{f.name}", name=f.name,
-                         size=f.size, height=info.height, source=info.source)
-        if cur is None or (pick.height, pick.size) > (cur.height, cur.size):
-            out[info.episode] = pick
+        out.setdefault(info.episode, []).append(LocalFile(
+            path=f"{path.rstrip('/')}/{f.name}", name=f.name,
+            size=f.size, height=info.height, source=info.source))
+    for lst in out.values():
+        lst.sort(key=lambda c: (-c.height, -c.size))
     return out
 
 
@@ -324,7 +354,7 @@ def build_series(
     foreign: List[str] = []
     local = scan_local(drive, base, season, titles, foreign, work)
     for r in rows:
-        r.local = local.get(r.episode)
+        r.copies = local.get(r.episode) or []
     step("local", f"网盘里已有 {len(local)} 集", saved=len(local))
     if foreign:
         # 同一目录里混进别的剧很常见，不说清楚会让人以为集数对不上是 bug
@@ -631,3 +661,56 @@ def fetch_episode(drive_factory: Callable[[], object], src: SourceFile,
         raise ValueError(f"分享里找不到这个文件了：{src.file.name}")
     drive.save_share_files(ctx, [target], to_dir)
     return f"{to_dir.rstrip('/')}/{target.name}"
+
+
+# 一集/一部片最多同时留几份。没有上限的话，一部热门电影能搜出十几个版本，
+# 全转下来既占网盘配额，也让「换来源」的列表长到没法用。
+DEFAULT_COPY_CAP = 5
+
+
+def fetch_all(drive_factory: Callable[[], object], sources: List[SourceFile],
+              to_dir: str, have: Optional[List[str]] = None,
+              cap: int = DEFAULT_COPY_CAP,
+              on_step: Optional[Callable[[str, dict], None]] = None) -> dict:
+    """把这一集（或这部片）的多个来源都转存下来，供播放时切换。
+
+    为什么要存多份：「哪一份能播」只有播起来才知道——原盘 MKV 浏览器解不了、
+    某个直链被 CDN 拒了、某一版没有中文字幕。事后再回来重新转存很折腾，
+    先各存一份，播放器里一键切换。
+
+    **单个来源失败不中断**：十个来源里挂两个是常态（分享失效、同名冲突），
+    为此放弃另外八个没道理。失败的原因收集起来一起报。
+    """
+    def step(stage, msg, **extra):
+        if on_step:
+            on_step(stage, dict(extra, message=msg))
+
+    seen = {n for n in (have or [])}
+    out = {"saved": [], "skipped": [], "errors": []}
+    picked = []
+    for src in sources:
+        if len(picked) >= cap:
+            break
+        # 同名的就是同一份，转第二次只会撞「已存在」
+        if src.file.name in seen:
+            out["skipped"].append(src.file.name)
+            continue
+        seen.add(src.file.name)
+        picked.append(src)
+
+    step("plan", f"准备转存 {len(picked)} 个版本"
+                 + (f"（已有 {len(out['skipped'])} 个跳过）" if out["skipped"] else ""))
+    for i, src in enumerate(picked, 1):
+        label = f"{src.file.height}p " if src.file.height else ""
+        try:
+            path = fetch_episode(drive_factory, src, to_dir)
+            out["saved"].append({"path": path, "name": src.file.name,
+                                 "size": src.file.size, "height": src.file.height,
+                                 "source": src.file.source})
+            step("save", f"{i}/{len(picked)} 已存 {label}{src.file.name[:44]}")
+        except Exception as e:
+            out["errors"].append(f"{src.file.name[:34]}：{str(e)[:70]}")
+            step("error", f"{i}/{len(picked)} 失败：{str(e)[:60]}")
+    step("done", f"存下 {len(out['saved'])} 个版本"
+                 + (f"，{len(out['errors'])} 个失败" if out["errors"] else ""))
+    return out

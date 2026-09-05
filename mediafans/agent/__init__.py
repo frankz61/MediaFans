@@ -18,7 +18,7 @@ from .rank import Scored, episode_yardstick, rank, score_one, title_match
 from .series import (
     EpisodeRow, LocalFile, SeriesCache, SeriesView, SourceFile,
     BatchGroup, BatchResult, build_series, fetch_batch, fetch_episode,
-    index_sources, plan_batch, scan_local,
+    index_sources, plan_batch, scan_local, fetch_all, DEFAULT_COPY_CAP,
     cn_season, multi_search, search_queries,
 )
 from .movie import (
@@ -36,6 +36,7 @@ __all__ = [
     "EpisodeRow", "LocalFile", "SourceFile", "SeriesView", "SeriesCache",
     "build_series", "fetch_episode", "scan_local", "index_sources",
     "BatchGroup", "BatchResult", "plan_batch", "fetch_batch",
+    "fetch_all", "DEFAULT_COPY_CAP",
     "search_queries", "multi_search", "cn_season",
     "build_movie", "movie_queries", "movie_sources", "scan_local_movie",
     "MOVIE_EPISODE",

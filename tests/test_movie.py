@@ -54,8 +54,8 @@ def test_movie_queries_skip_original_when_same_as_title():
 
 
 # ---------------------------------------------------------------- 扫本地
-def test_scan_local_movie_picks_the_best_version():
-    """同一部片存了几版，挑画质最高的——体积只在画质持平时才作数。"""
+def test_scan_local_movie_keeps_every_version_best_first():
+    """同一部片存了几版，全都留着，画质最高的排前面——播不了才好换。"""
     drive = FakeDrive({"/MediaFans/流浪地球": [
         _f("流浪地球.2019.1080p.WEB-DL.mkv", size=BIG),      # 更大但更糊
         _f("流浪地球.2019.2160p.WEB-DL.mkv", size=BIG // 2),
@@ -63,9 +63,8 @@ def test_scan_local_movie_picks_the_best_version():
     ]})
     got = scan_local_movie(drive, "/MediaFans/流浪地球",
                            Work(titles=["流浪地球", "The Wandering Earth"]))
-    assert got is not None
-    assert got.height == 2160
-    assert got.path == "/MediaFans/流浪地球/流浪地球.2019.2160p.WEB-DL.mkv"
+    assert [c.height for c in got] == [2160, 1080]
+    assert got[0].path == "/MediaFans/流浪地球/流浪地球.2019.2160p.WEB-DL.mkv"
 
 
 def test_scan_local_movie_rejects_another_film_in_the_same_folder():
@@ -77,12 +76,12 @@ def test_scan_local_movie_rejects_another_film_in_the_same_folder():
     ]})
     got = scan_local_movie(drive, "/MediaFans/流浪地球",
                            Work(titles=["流浪地球", "The Wandering Earth"]), foreign)
-    assert got.name.startswith("流浪地球")
+    assert [c.name for c in got] == ["流浪地球.2019.1080p.WEB-DL.mkv"]
     assert foreign == ["The.Gentlemen.2024.2160p.WEB-DL.mkv"]
 
 
-def test_scan_local_movie_on_missing_dir_is_none():
-    assert scan_local_movie(FakeDrive(), "/MediaFans/没有", Work()) is None
+def test_scan_local_movie_on_missing_dir_is_empty():
+    assert scan_local_movie(FakeDrive(), "/MediaFans/没有", Work()) == []
 
 
 # ---------------------------------------------------------------- 来源
