@@ -1456,8 +1456,14 @@ PAGE_HTML = r"""<!doctype html>
   .wall-note { grid-column:1/-1; color:var(--dim); font-size:11px; padding:6px 2px 2px;
                border-top:1px solid var(--line); margin-top:4px; }
   .wall-note:first-child { border-top:none; margin-top:0; }
+  /* grid-auto-rows 必须写死成 max-content。
+     海报是 `width:100% + aspect-ratio:2/3`，这种图**在算行高时贡献的高度是 0**
+     （百分比宽度对着不定容器解不出来），于是默认的 auto 行只按标题那 41px 算，
+     再被 align-content:stretch 平摊成每行 39px，海报被 overflow:hidden 裁成一条。
+     手机上尤其明显：屏窄行多，629px 摊给 13 行。max-content 强制按内容取行高。 */
   #shows { flex:1; overflow-y:auto; padding:8px;
-           display:grid; grid-template-columns:repeat(auto-fill,minmax(104px,1fr)); gap:10px; }
+           display:grid; grid-template-columns:repeat(auto-fill,minmax(104px,1fr));
+           grid-auto-rows:max-content; align-content:start; gap:10px; }
   .card { cursor:pointer; border-radius:8px; overflow:hidden; background:var(--panel);
           border:1px solid var(--line); display:flex; flex-direction:column; }
   .card:hover { border-color:var(--accent); }

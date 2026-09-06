@@ -1401,3 +1401,20 @@ def test_every_series_call_from_the_page_sends_media():
         body = _js_fn(fn)
         assert ep in body, f"{fn} 不再调用 {ep}？"
         assert "media" in body, f"{fn} 没有把 media 发出去"
+
+
+def test_poster_grid_pins_row_height_to_content():
+    """海报墙的行高必须写死成 max-content，别退回 auto。
+
+    海报是 `width:100% + aspect-ratio:2/3`，这种图**在算网格行高时贡献 0**
+    （百分比宽度对着不定容器解不出来）。auto 行于是只按标题那 41px 算，
+    再被 align-content:stretch 平摊，海报被 card 的 overflow:hidden 裁成一条。
+
+    手机上尤其惨：实测 375px 宽、13 行摊 629px → 每行 39px，海报只剩一条色带，
+    标题也一起被裁掉。改成 max-content 后行高 210px（168 图 + 41 标题）。
+    """
+    from mediafans.web import PAGE_HTML
+
+    grid = PAGE_HTML.split("#shows {")[1].split("}")[0]
+    assert "grid-auto-rows:max-content" in grid.replace(" ", "")
+    assert "aspect-ratio:2/3" in PAGE_HTML.replace(" ", "")
