@@ -18,7 +18,9 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.DefaultRenderersFactory
+import androidx.media3.exoplayer.LoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
@@ -137,6 +139,7 @@ class PlayerActivity : Activity() {
             .setReadTimeoutMs(60000)
 
         val p = ExoPlayer.Builder(this)
+            .setLoadControl(loadControl())
             .setRenderersFactory(
                 // 软解兜底：电视盒子硬解不了某条轨时（少见但有），
                 // 让它退到软解而不是直接黑屏
@@ -159,14 +162,38 @@ class PlayerActivity : Activity() {
             override fun onPlayerError(error: PlaybackException) {
                 onFailed(s, error)
             }
+
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_BUFFERING) onRebuffer(s)
+            }
         })
         p.prepare()
         player = p
         view.player = p
+        if (streams.size > 1) {
+            hint.visibility = View.VISIBLE
+            hint.text = s.label + "　·　⬆更清晰 / ⬇更流畅"
+            ticker.postDelayed({ hint.visibility = View.GONE }, 5000)
+        }
         view.keepScreenOn = true
         view.requestFocus()
         startReporting()
     }
+
+    /**
+     * 缓冲策略。默认那套是按「网速稳定的手机看转码流」调的，对这里不合适：
+     * 原盘码率实测 12 Mbps（1.82GB / 19.8 分钟），是同一部片 4K 转码档的两倍，
+     * 而电视多半挂 Wi-Fi。默认起播只等 2.5 秒、卡顿后只等 5 秒就恢复播放，
+     * 缓冲还没垫起来就又开始放，于是一路走走停停。
+     *
+     * 加大到：缓冲目标 60 秒 / 最多 256MB，卡顿后等 8 秒再续播。
+     * 代价是起播慢一点（2.5→4 秒），换来的是别一直卡。
+     */
+    private fun loadControl(): LoadControl = DefaultLoadControl.Builder()
+        .setBufferDurationsMs(60_000, 120_000, 4_000, 8_000)
+        .setTargetBufferBytes(256 * 1024 * 1024)
+        .setPrioritizeTimeOverSizeThresholds(true)
+        .build()
 
     /**
      * 这一条播不了就换下一条。
@@ -220,6 +247,48 @@ class PlayerActivity : Activity() {
         hint.text = "播放失败：${error.errorCodeName}\n${error.message.orEmpty()}"
     }
 
+    // 卡顿计数。起播那次不算——那是正常的首次缓冲，不是卡。
+    private var rebuffers = 0
+    private var rebufferWindowStart = 0L
+    private var autoDownshifted = false
+
+    /**
+     * 卡了就自动降一档。
+     *
+     * 「卡顿」和「播放失败」不一样：失败会抛 PlaybackException，卡顿什么都不抛，
+     * 只是 STATE_BUFFERING 来回跳。用户在电视前看到的就是走走停停，
+     * 而 TV 端播放中原本没有切档入口，只能干等。
+     *
+     * 判据是**一分钟内卡 3 次**：偶尔卡一下是网络抖动，降档反而降了画质；
+     * 连着卡才说明这条码率这台设备/这个网络扛不住。只自动降一次，
+     * 之后交给用户手动选——反复自动切换比卡顿更烦人。
+     */
+    private fun onRebuffer(s: Stream) {
+        val now = System.currentTimeMillis()
+        val playing = (player?.currentPosition ?: 0L) > 3000L
+        if (!playing) return                       // 起播/seek 的缓冲不算
+        if (now - rebufferWindowStart > 60_000L) {
+            rebufferWindowStart = now
+            rebuffers = 0
+        }
+        rebuffers++
+        if (rebuffers < 3 || autoDownshifted) return
+
+        val lower = lowerThan(s) ?: return
+        autoDownshifted = true
+        hint.visibility = View.VISIBLE
+        hint.text = "网络跟不上这一档，已自动降到" + lower.label + "（按⬆可以再切回去）"
+        startMs = player?.currentPosition ?: startMs
+        start(lower)
+    }
+
+    /** 比当前这条更省带宽的一档。原画在这里排最高——它就是没压过的那份。 */
+    private fun lowerThan(s: Stream): Stream? {
+        val ordered = streams.sortedByDescending { if (it.origin) Int.MAX_VALUE else it.height }
+        val i = ordered.indexOfFirst { it.key == s.key }
+        return if (i >= 0 && i + 1 < ordered.size) ordered[i + 1] else null
+    }
+
     private fun guessMime(m: String): String = when {
         m.contains("mpegurl", true) -> MimeTypes.APPLICATION_M3U8
         m.contains("matroska", true) -> MimeTypes.VIDEO_MATROSKA
@@ -260,10 +329,44 @@ class PlayerActivity : Activity() {
         ticker.postDelayed(report, 15000)
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        // 电视遥控器上「媒体停止」和返回都该退出播放
-        if (keyCode == KeyEvent.KEYCODE_MEDIA_STOP) { finish(); return true }
-        return super.onKeyDown(keyCode, event)
+    /**
+     * 上下键切清晰度。
+     *
+     * 必须在 dispatchKeyEvent 里拦，不能用 onKeyDown：PlayerView 拿着焦点，
+     * 它的控制条会先把方向键吃掉用于按钮间移动，Activity 的 onKeyDown 根本收不到。
+     * 实测就是这样——按 ⬇ 毫无反应。dispatchKeyEvent 在分发给视图树之前。
+     *
+     * 为什么这个入口是刚需：网页端有一排清晰度按钮，电视端原本什么都没有。
+     * 而「卡了想换一档」恰恰是电视上最常见的诉求（原盘码率是转码档的两倍）。
+     */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            when (event.keyCode) {
+                KeyEvent.KEYCODE_MEDIA_STOP -> { finish(); return true }
+                KeyEvent.KEYCODE_DPAD_UP -> { switchBy(-1); return true }
+                KeyEvent.KEYCODE_DPAD_DOWN -> { switchBy(1); return true }
+            }
+        } else if (event.action == KeyEvent.ACTION_UP &&
+                   (event.keyCode == KeyEvent.KEYCODE_DPAD_UP ||
+                    event.keyCode == KeyEvent.KEYCODE_DPAD_DOWN)) {
+            return true          // 按下已经处理了，抬起也别再往下传
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    /** step=-1 往高画质走，+1 往低画质走。 */
+    private fun switchBy(step: Int) {
+        val cur = current ?: return
+        if (streams.size < 2) return
+        val ordered = streams.sortedByDescending { if (it.origin) Int.MAX_VALUE else it.height }
+        val i = ordered.indexOfFirst { it.key == cur.key }
+        val target = ordered.getOrNull(i + step) ?: return
+        // 手动选过就别再自动降档了，用户比启发式清楚自己要什么
+        autoDownshifted = true
+        hint.visibility = View.VISIBLE
+        hint.text = "切到" + target.label + "…（⬆更清晰 / ⬇更流畅）"
+        startMs = player?.currentPosition ?: startMs
+        start(target)
     }
 
     override fun onStop() {
