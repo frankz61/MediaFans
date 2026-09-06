@@ -12,14 +12,20 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -39,6 +45,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -94,29 +101,46 @@ fun SetupScreen(settings: Settings, onDone: () -> Unit) {
     val first = remember { FocusRequester() }
     LaunchedEffect(Unit) { runCatching { first.requestFocus() } }
 
-    Column(Modifier.fillMaxSize().padding(OVERSCAN), verticalArrangement = Arrangement.Center) {
-        Title("连接到 MediaFans 服务", 30)
-        Spacer(Modifier.height(6.dp))
-        Sub("填网页端那台服务的地址和令牌。电视上打字麻烦，填一次就够了。")
-        Spacer(Modifier.height(24.dp))
+    val save = {
+        settings.base = base
+        settings.token = token
+        settings.netdisk = nd
+        if (settings.configured) onDone()
+    }
 
-        Field("服务器地址", base, "https://example.com:12583", first) { base = it }
-        Spacer(Modifier.height(14.dp))
-        Field("访问令牌", token, "网页端 URL 里 token= 后面那串") { token = it }
-        Spacer(Modifier.height(20.dp))
+    // 这一页在手机上会被输入法吃掉大半高度（横屏尤其惨），所以：
+    // 能滚 + 顶对齐 + imePadding。原来是垂直居中且不可滚，输入法一弹，
+    // 「保存并进入」直接被顶到屏幕外，看起来就像没有确认按钮。
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .imePadding()
+            .padding(OVERSCAN),
+    ) {
+        Title("连接到 MediaFans 服务", 26)
+        Spacer(Modifier.height(4.dp))
+        Sub("填网页端那台服务的地址和令牌。填一次就够了。")
+        Spacer(Modifier.height(16.dp))
 
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Field("服务器地址", base, "https://example.com:12583", first,
+              imeAction = ImeAction.Next) { base = it }
+        Spacer(Modifier.height(12.dp))
+        // 令牌这一栏的键盘上给「完成」：手机横屏时按钮多半在屏幕外，
+        // 键盘上那个对勾才是最先够得着的确认入口
+        Field("访问令牌", token, "网页端 URL 里 token= 后面那串",
+              imeAction = ImeAction.Done, onDone = { save() }) { token = it }
+        Spacer(Modifier.height(16.dp))
+
+        Row(verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Sub("网盘", 16, T.Text)
             TvButton(if (nd == "quark") "● 夸克" else "○ 夸克") { nd = "quark" }
             TvButton(if (nd == "baidu") "● 百度" else "○ 百度") { nd = "baidu" }
         }
+        Spacer(Modifier.height(16.dp))
+        TvButton("保存并进入", onClick = save)
         Spacer(Modifier.height(24.dp))
-        TvButton("保存并进入") {
-            settings.base = base
-            settings.token = token
-            settings.netdisk = nd
-            if (settings.configured) onDone()
-        }
     }
 }
 
@@ -126,20 +150,28 @@ private fun Field(
     value: String,
     hint: String,
     focusRequester: FocusRequester? = null,
+    imeAction: ImeAction = ImeAction.Default,
+    onDone: (() -> Unit)? = null,
     onChange: (String) -> Unit,
 ) {
     Column {
-        Sub(label, 14)
-        Spacer(Modifier.height(4.dp))
+        if (label.isNotEmpty()) {
+            Sub(label, 14)
+            Spacer(Modifier.height(4.dp))
+        }
         var focused by remember { mutableStateOf(false) }
         BasicTextField(
             value = value,
             onValueChange = onChange,
             singleLine = true,
             textStyle = TextStyle(color = T.Text, fontSize = 18.sp),
+            keyboardOptions = KeyboardOptions(imeAction = imeAction),
+            keyboardActions = KeyboardActions(onDone = { onDone?.invoke() }),
             cursorBrush = androidx.compose.ui.graphics.SolidColor(T.Accent),
             modifier = (focusRequester?.let { Modifier.focusRequester(it) } ?: Modifier)
-                .width(700.dp)
+                // 窄屏上写死 700dp 会横向溢出，取两者较小
+                .fillMaxWidth()
+                .widthIn(max = 700.dp)
                 .clip(RoundedCornerShape(8.dp))
                 .background(T.Panel)
                 .padding(14.dp)

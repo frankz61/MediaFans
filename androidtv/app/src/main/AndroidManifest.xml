@@ -16,10 +16,13 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.MediaFans">
 
+        <!-- 主界面不锁横屏：电视本来就只有横屏，锁了只会坑手机——
+             竖屏可用高度多一倍，输入法弹出来才装得下。
+             adjustResize 让窗口给输入法让位，配合页面自己的滚动。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:screenOrientation="landscape"
+            android:windowSoftInputMode="adjustResize"
             android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|smallestScreenSize|uiMode">
             <!-- LEANBACK_LAUNCHER 才会出现在电视桌面上；
                  同时留一个普通 LAUNCHER，插在手机/平板上也能打开来调试 -->
