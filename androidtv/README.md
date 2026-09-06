@@ -31,7 +31,34 @@ echo "sdk.dir=/你的/Android/Sdk" > local.properties   # Windows 用正斜杠
 产物在 `app/build/outputs/apk/debug/app-debug.apk`。release 用的是 debug 签名——
 电视上装的是侧载包，没签名装不上，而这个 app 不上应用商店。
 
-## 装到电视上
+## 发布：让电视直接下载
+
+电视上多半没有 adb，最省事的是让它自己去下。把 APK 放到服务器上，
+用已有的 nginx 发出去（下面的域名/端口按自己的填）：
+
+```nginx
+# 放在反代 location / 之前，不进应用、不要令牌——
+# 装 app 的场景就是「还没有令牌」，挡在令牌后面等于装不了。
+# 包里不含任何凭据（服务器地址和令牌是用户自己在 app 里填的）。
+location = /tv.apk {
+    alias /var/www/mediafans/tv.apk;
+    default_type application/vnd.android.package-archive;
+    add_header Content-Disposition 'attachment; filename="MediaFans-TV.apk"';
+    add_header Cache-Control "no-cache";
+}
+```
+
+再在 80 端口加一条短地址，遥控器上少打几个字符。**只做 302，实际下载仍走 TLS**
+——APK 用明文传有被掉包的风险，不能图省事直接在 80 上发文件：
+
+```nginx
+location = /tv.apk { return 302 https://$host:<https端口>/tv.apk; }
+```
+
+电视上用任意「下载器」类应用输入这个地址即可。装完记得核对 sha256，
+跟本地 `app-debug.apk` 一致才对。
+
+## 装到电视上（有 adb 的话）
 
 电视和电脑在同一个网内：
 
