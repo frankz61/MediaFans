@@ -50,6 +50,7 @@ class PlayerActivity : Activity() {
     private val ticker = Handler(Looper.getMainLooper())
 
     private lateinit var api: Api
+    private lateinit var settings: Settings
     private lateinit var path: String
     private var displayName = ""
     private var startMs = 0L
@@ -69,7 +70,8 @@ class PlayerActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        api = Api(Settings(this))
+        settings = Settings(this)
+        api = Api(settings)
 
         path = intent.getStringExtra(EX_PATH).orEmpty()
         displayName = intent.getStringExtra(EX_NAME).orEmpty()
@@ -121,7 +123,7 @@ class PlayerActivity : Activity() {
                 runCatching { withContext(Dispatchers.IO) { api.watchGet(path) } }
                     .onSuccess { if (it > 0) startMs = it * 1000L }
             }
-            start(info.pick(preferOrigin = true) ?: streams.first())
+            start(info.pick(settings.quality) ?: streams.first())
         }
     }
 
@@ -361,8 +363,11 @@ class PlayerActivity : Activity() {
         val ordered = streams.sortedByDescending { if (it.origin) Int.MAX_VALUE else it.height }
         val i = ordered.indexOfFirst { it.key == cur.key }
         val target = ordered.getOrNull(i + step) ?: return
-        // 手动选过就别再自动降档了，用户比启发式清楚自己要什么
+        // 手动选过就别再自动降档了，用户比启发式清楚自己要什么。
+        // 也记下来跨文件沿用——每集都要重按一次太折磨人。
+        // 注意只记手动的：自动降档是对当下网络的临时反应，不该覆盖用户的选择。
         autoDownshifted = true
+        settings.quality = target.key
         hint.visibility = View.VISIBLE
         hint.text = "切到" + target.label + "…（⬆更清晰 / ⬇更流畅）"
         startMs = player?.currentPosition ?: startMs

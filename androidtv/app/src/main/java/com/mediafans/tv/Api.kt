@@ -32,6 +32,11 @@ class Settings(ctx: Context) {
         get() = sp.getString("nd", "quark")!!
         set(v) = sp.edit().putString("nd", v).apply()
 
+    /** 上次手动选过的清晰度（4k/super/high/low/origin），跨文件沿用。 */
+    var quality: String
+        get() = sp.getString("quality", "")!!
+        set(v) = sp.edit().putString("quality", v).apply()
+
     val configured: Boolean get() = base.isNotEmpty()
 }
 
@@ -110,6 +115,10 @@ data class Stream(
     val mime: String,
 )
 
+// 夸克的清晰度阶梯：档位 key -> 标称高度。origin 没有固定高度，单独当最高档处理。
+private val LADDER = mapOf("4k" to 2160, "2k" to 1440, "super" to 810,
+                           "high" to 540, "low" to 270, "normal" to 540)
+
 data class PlayInfo(
     val fileName: String,
     val streams: List<Stream>,
@@ -117,16 +126,35 @@ data class PlayInfo(
     val direct: Boolean,
 ) {
     /**
-     * 电视上默认播原画。
+     * 默认播**最高的转码档**，不是原画。
      *
-     * 浏览器端默认挑转码档，是因为浏览器解不了 HEVC/DTS-HD 的原盘；电视盒子能硬解，
-     * 而转码档是网盘二次压缩过的。所以这里反过来——**原画优先**，没有原画才退转码档。
-     * 这也顺带绕开了「网盘没把文件认成视频、压根没有转码档」那一类资源。
+     * 一开始这里是原画优先，理由是电视盒子能硬解 HEVC、而转码档是网盘二次压缩过的。
+     * 解码能力这条没错，但**带宽这条更硬**：实测同一集原盘 1.82GB / 19.8 分钟
+     * 约 12.2 Mbps，而它的 4K 转码档只要 6380 kbps，正好一半。电视挂 Wi-Fi，
+     * 原画实际播不动——画质再好，卡着就是不能看。
+     *
+     * 原画仍然一按 ⬆ 就能切回去，网络好的时候值得。
+     *
+     * 手动选过的档优先（`want`）：用户比这里的启发式清楚自己家的网。
+     * 那一档这个文件没有时，退到高度最接近且不超过它的一档——跟网页端同一套规则。
      */
-    fun pick(preferOrigin: Boolean = true): Stream? {
+    fun pick(want: String = ""): Stream? {
         if (streams.isEmpty()) return null
-        if (preferOrigin) streams.firstOrNull { it.origin }?.let { return it }
-        return streams.firstOrNull { it.key == defaultKey } ?: streams.first()
+        if (want.isNotEmpty()) {
+            streams.firstOrNull { it.key == want }?.let { return it }
+            // 这个文件没有那一档：退到高度最接近且不超过它的一档。
+            // 高度得查固定阶梯——从 streams 里查是查不到的，能查到就已经 return 了。
+            LADDER[want]?.let { wantH ->
+                streams.filter { !it.origin && it.height in 1..wantH }
+                    .maxByOrNull { it.height }?.let { return it }
+            }
+        }
+        // 转码档是 h264+aac，码率也低一半，是「能播且够看」的那个选择
+        streams.filter { !it.origin && it.height > 0 }.maxByOrNull { it.height }
+            ?.let { return it }
+        return streams.firstOrNull { !it.origin }
+            ?: streams.firstOrNull { it.key == defaultKey }
+            ?: streams.first()
     }
 }
 
