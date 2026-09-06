@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 电视桌面的横幅（320x180）。TV 应用没有它装不上。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp" android:height="180dp"
+    android:viewportWidth="320" android:viewportHeight="180">
+    <path android:fillColor="#12151C" android:pathData="M0,0h320v180h-320z" />
+    <path android:fillColor="#4C8DFF"
+        android:pathData="M108,66 L150,90 L108,114 Z" />
+    <path android:fillColor="#E8ECF4"
+        android:pathData="M164,80h6v24h-6z M176,80h6v24h-6z M188,80h6v24h-6z M200,80h6v24h-6z" />
+</vector>

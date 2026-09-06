@@ -1,0 +1,58 @@
+# MediaFans TV
+
+电视端。**它不是把网页端套个壳**——套壳解决不了电视上最要紧的那件事。
+
+## 为什么要单独做一个
+
+网页端在电视浏览器里能开，但会卡在解码上：网盘里画质最好的那一份往往是
+原盘 MKV（HEVC 视频 + DTS-HD 音轨），**浏览器解不了，而且不报错**，
+只会黑屏一直往下载。主项目 README 的「为什么有些文件只有原画」记着一个实测：
+一个目录 40 个可播放文件，13 个被夸克标成了图片、压根没有转码档可退。
+
+电视盒子有硬解。所以这个 app 的播放器**默认播原画**（`PlayInfo.pick`），
+跟网页端优先挑转码档正好相反。
+
+另外两件只有原生端能做好的：D-pad 焦点、遥控器的媒体键。
+
+## 它不做什么
+
+- **不做登录**。夸克/百度的扫码在网页端做，电视上扫码输码都难受。
+- **不做批量转存**。找资源和单集转存有，「全部 N 版」那种长任务留在网页端。
+- 不存任何凭据，只存服务器地址和访问令牌。
+
+## 编译
+
+```bash
+cd androidtv
+echo "sdk.dir=/你的/Android/Sdk" > local.properties   # Windows 用正斜杠
+./gradlew :app:assembleDebug
+```
+
+产物在 `app/build/outputs/apk/debug/app-debug.apk`。release 用的是 debug 签名——
+电视上装的是侧载包，没签名装不上，而这个 app 不上应用商店。
+
+## 装到电视上
+
+电视和电脑在同一个网内：
+
+```bash
+adb connect <电视IP>:5555
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+电视上要先开「开发者选项 → USB 调试 / 网络调试」。装完在电视桌面能看到
+MediaFans（`LEANBACK_LAUNCHER`）。
+
+首次打开填两样：服务器地址（`https://主机:端口`）和访问令牌
+（网页端 URL 里 `token=` 后面那串）。填一次就存下来了。
+
+## 结构
+
+| 文件 | 干什么 |
+|---|---|
+| `Api.kt` | REST 客户端 + 数据模型。刻意用 HttpURLConnection + org.json，少两个依赖 |
+| `Focus.kt` | `FocusBox`：焦点态同时给放大、描边、变色三个信号。电视上没有指针，一个信号不够 |
+| `Screens.kt` | 设置 / 首页 / 搜索 / 作品页 |
+| `PlayerActivity.kt` | ExoPlayer。默认原画、失败逐级换源、每 15 秒和退出时上报进度 |
+
+进度跟网页端共用服务端那份记录，所以**电视上看到一半，手机上接着看**。

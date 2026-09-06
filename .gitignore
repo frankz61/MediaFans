@@ -21,3 +21,12 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Android TV 端
+# 本机的 SDK 路径，换台机器就不对了
+androidtv/local.properties
+androidtv/.gradle/
+androidtv/build/
+androidtv/app/build/
+androidtv/.idea/
+*.apk
