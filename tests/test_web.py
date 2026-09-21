@@ -1514,3 +1514,19 @@ def test_page_guards_against_double_clicks_and_paints_cache_first():
     ls = _js_fn("loadShows")
     assert "cacheGet('discover_' + kind)" in ls and "cachePut('discover_' + kind" in ls
     assert "cacheGet('recent')" in _js_fn("renderWatch")
+
+
+def test_mobile_portrait_collapses_player_rows_so_episodes_are_reachable():
+    """竖屏播放时视频下面那四排要 150px，375x812 上集列表只剩 146px（两行）。
+
+    默认收起清晰度/来源/导航，只留一行「片名 · 清晰度⋯」，点一下展开。
+    实测集列表 146 → 258px、2 行 → 4 行。
+    """
+    from mediafans.web import PAGE_HTML
+
+    assert 'id="pbar"' in PAGE_HTML and "function togglePlayerRows" in PAGE_HTML
+    mobile = PAGE_HTML.split("@media (max-width: 820px)")[1]
+    assert "body.has-video:not(.pexp) #quality" in mobile
+    assert "body.has-video:not(.pexp) #navbar" in mobile
+    # 桌面上这一条不显示
+    assert "#pbar { display:none; }" in PAGE_HTML

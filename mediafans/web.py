@@ -1418,6 +1418,7 @@ PAGE_HTML = r"""<!doctype html>
   #meta .title { font-size:15px; font-weight:600; word-break:break-all; }
   #meta .sub { color:var(--dim); font-size:12px; }
   #hint { color:var(--dim); font-size:12px; padding:6px 4px; }
+  #pbar { display:none; }
   /* 防呆：有请求在飞时，会触发新请求的入口一律不可点。
      手机上「点了没反应就再点一下」是本能，两次点击会开两个 /api/play，
      后一个还可能把前一个的结果盖掉。顶部的细条告诉用户「在忙，别点了」。 */
@@ -1640,6 +1641,26 @@ PAGE_HTML = r"""<!doctype html>
     #quality::-webkit-scrollbar, #navbar::-webkit-scrollbar { display:none; }
     #quality > *, #navbar > * { flex:none; white-space:nowrap; }
     #meta { padding:4px 8px; }
+    /* 竖屏播放时视频下面那四排（清晰度/来源/导航/片名）要 150px，实测 375x812 上
+       集列表只剩 146px——两行，选集根本选不到。改成默认收起，只留一行
+       「片名 · 清晰度⋯」，点一下展开。在剧集页上「上一集/下一集」本来就被列表取代了。 */
+    body.has-video #pbar { display:flex; align-items:center; gap:8px; padding:4px 8px 2px;
+                           font-size:12px; }
+    #pbar .t { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+               color:var(--text); }
+    #pbar button { flex:none; }
+    body.has-video:not(.pexp) #quality,
+    body.has-video:not(.pexp) #sources,
+    body.has-video:not(.pexp) #navbar,
+    body.has-video #meta { display:none; }
+    /* 剧集页头也压一压：标题、季、统计三行原来要 100px */
+    #seriesHead { padding:6px 10px 4px; }
+    #seriesHead h2 { font-size:15px; margin:0; }
+    #seriesStat { margin-top:2px; }
+    #seasonTabs button { padding:3px 8px; font-size:12px; }
+    /* 底栏里的网盘目录路径在手机上只是噪音，按钮留下 */
+    #seriesDir { display:none; }
+    #seriesFoot { padding:6px 10px; }
     #meta .title { font-size:14px; overflow:hidden; text-overflow:ellipsis;
                    white-space:nowrap; word-break:normal; }
     #hint { padding:2px 8px 6px; font-size:11px; line-height:1.4;
@@ -1885,6 +1906,10 @@ PAGE_HTML = r"""<!doctype html>
       </div>
     </div>
     <div id="loadbar"></div>
+    <div id="pbar">
+      <span class="t" id="pbarTitle"></span>
+      <button class="linkbtn" id="pbarMore" onclick="togglePlayerRows()">清晰度 ⋯</button>
+    </div>
     <div id="quality"></div>
     <div id="sources"></div>
     <div id="navbar" style="display:none">
@@ -2273,6 +2298,7 @@ async function playFile(f) {
     if (seq !== playSeq) return;                    // 期间又点了别的，这次作废
     if (data.error) throw new Error(data.error);
     $('#title').textContent = data.file_name;
+    $('#pbarTitle').textContent = data.file_name;
     $('#sub').textContent = f.size_h || '';
     curPath = f.path;
     const pick = chooseStream(data);
@@ -2691,6 +2717,12 @@ function toggleFullscreen() {
   try { p = req ? req.call(stage) : Promise.reject(); }
   catch (e) { p = Promise.reject(e); }
   Promise.resolve(p).then(applyOrientation).catch(() => theater(true));
+}
+
+// 手机竖屏：视频下面那几排默认收起（CSS 里 body.has-video:not(.pexp)），点 ⋯ 展开
+function togglePlayerRows() {
+  const on = document.body.classList.toggle('pexp');
+  $('#pbarMore').textContent = on ? '收起 ⋯' : '清晰度 ⋯';
 }
 
 // ---------------- 手机全屏：默认横屏，可切竖屏 ----------------
