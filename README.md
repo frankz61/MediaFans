@@ -514,6 +514,22 @@ E01-E05 2160p / E06 掉到 1080p / E07 存了两份。而且 27 集意味着开 
 **亮度是画面亮度，不是屏幕背光**——浏览器没有调背光的 API，能做的只有对 video 加
 `filter: brightness()`。观感接近，但只影响视频区，环境光很强时不如真背光。
 
+**iPhone 上的全屏走的是另一条路。** iPhone 的 Safari 不支持 `Element.requestFullscreen`
+（iPad 和桌面都支持），只允许 `<video>` 自己进系统全屏：`video.webkitEnterFullscreen()`。
+之前的逻辑在 iPhone 上退化成「网页全屏」——地址栏和底栏都还在、也不会横屏，
+看起来就是「全屏没反应」。
+
+三个细节都是 iOS 特有的：
+
+- 必须在点击的**同步调用栈**里调。塞进 `Promise.catch` 里会丢掉用户手势，被 iOS 拒绝。
+- 系统全屏不触发 `fullscreenchange`，得听 video 自己的 `webkitbeginfullscreen` /
+  `webkitendfullscreen`。
+- 退出系统全屏时 iOS 会顺手把视频暂停。用户是想回小窗接着看，不是想停，
+  所以在 `webkitendfullscreen` 里试着续播。
+
+代价是进了系统全屏用的是 iOS 自带的控制条——上面那套悬浮控制条、手势、
+亮度调节在里面都不生效。这是平台限制，换来的是真正的全屏和横屏。
+
 ### 死链很多，所以分批探、够用就停
 
 搜索源返回的前几条经常是死链。实测搜「异人之下」，前 6 条**全部**是

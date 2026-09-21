@@ -1418,3 +1418,23 @@ def test_poster_grid_pins_row_height_to_content():
     grid = PAGE_HTML.split("#shows {")[1].split("}")[0]
     assert "grid-auto-rows:max-content" in grid.replace(" ", "")
     assert "aspect-ratio:2/3" in PAGE_HTML.replace(" ", "")
+
+
+def test_iphone_uses_native_video_fullscreen():
+    """iPhone 的 Safari 不支持 Element.requestFullscreen，只有 <video> 能进系统全屏。
+
+    之前的逻辑在 iPhone 上退化成「网页全屏」：地址栏和底栏都还在、也不会横屏，
+    用户看到的就是「全屏没反应」。iPad 和桌面浏览器仍走标准接口。
+    """
+    body = _js_fn("toggleFullscreen")
+    assert "video.webkitEnterFullscreen()" in body
+    # 必须在点击的同步调用栈里调：塞进 Promise.catch 会丢掉用户手势，被 iOS 拒绝
+    ios_call = body.index("video.webkitEnterFullscreen()")
+    promise = body.index("Promise.resolve(p)")
+    assert ios_call < promise
+    # iOS 系统全屏不触发 fullscreenchange，得听 video 自己的事件
+    from mediafans.web import PAGE_HTML
+
+    assert "'webkitbeginfullscreen'" in PAGE_HTML and "'webkitendfullscreen'" in PAGE_HTML
+    # iPad / 旧 Safari 只发带前缀的 change 事件
+    assert "'webkitfullscreenchange'" in PAGE_HTML

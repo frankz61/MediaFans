@@ -2553,16 +2553,53 @@ function endGesture(e) {
 stage.addEventListener('pointerup', endGesture);
 stage.addEventListener('pointercancel', endGesture);
 
+// iPhone 上的 Safari 不支持 Element.requestFullscreen（iPad 支持，桌面都支持）。
+// 它只允许 <video> 自己进系统全屏：video.webkitEnterFullscreen()。
+// 代价是进去以后用的是 iOS 自带的播放器控制条——我们的悬浮控制条、手势、
+// 亮度调节在里面都不生效；换来的是真正的全屏、能横屏、有系统的手势。
+// 之前的逻辑在 iPhone 上会退化成「网页全屏」：地址栏和底栏都还在，
+// 也不会横屏，看起来就是「全屏没反应」。
+function iosNativeFullscreen() {
+  return !document.fullscreenEnabled && !stage.requestFullscreen
+      && !stage.webkitRequestFullscreen
+      && typeof video.webkitEnterFullscreen === 'function';
+}
+
 function toggleFullscreen() {
-  if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    return;
+  }
+  if (video.webkitDisplayingFullscreen) { video.webkitExitFullscreen(); return; }
   if (document.body.classList.contains('theater')) { theater(false); return; }
+
+  if (iosNativeFullscreen()) {
+    // 必须在点击的同步调用栈里调，塞进 Promise.catch 里会丢掉用户手势，被 iOS 拒绝。
+    // 元数据没加载完时它会抛 InvalidStateError，那就先退化成网页全屏。
+    try { video.webkitEnterFullscreen(); return; } catch (e) {}
+    theater(true);
+    return;
+  }
   // 真全屏要浏览器给权限（需要用户手势，嵌入式/受限环境可能直接拒绝）。
   // 拒绝了就退化成铺满窗口的网页全屏，至少不能点了没反应。
+  const req = stage.requestFullscreen || stage.webkitRequestFullscreen;
   let p;
-  try { p = stage.requestFullscreen ? stage.requestFullscreen() : Promise.reject(); }
+  try { p = req ? req.call(stage) : Promise.reject(); }
   catch (e) { p = Promise.reject(e); }
   Promise.resolve(p).catch(() => theater(true));
 }
+
+// iOS 系统全屏不触发 fullscreenchange，得听 video 自己的这两个事件
+video.addEventListener('webkitbeginfullscreen', () => {
+  theater(false);
+  $('#fsBtn').textContent = '⤢';
+});
+video.addEventListener('webkitendfullscreen', () => {
+  $('#fsBtn').textContent = '⛶';
+  // iOS 退出系统全屏时会顺手把视频暂停。用户是想回到小窗接着看，不是想停——
+  // 这里试着续播；被拒（没有用户手势）就算了，控制条还在。
+  if (!video.ended) video.play().catch(() => {});
+});
 
 function syncVolume() {
   $('#vol').value = video.muted ? 0 : video.volume;
@@ -2633,10 +2670,14 @@ video.addEventListener('volumechange', syncVolume);
 video.addEventListener('play', () => { $('#playBtn').textContent = '⏸'; });
 video.addEventListener('pause', () => { $('#playBtn').textContent = '▶'; });
 video.addEventListener('ratechange', () => { $('#rate').value = String(video.playbackRate); });
-document.addEventListener('fullscreenchange', () => {
-  if (document.fullscreenElement) theater(false);   // 真全屏成了就别叠着网页全屏
-  $('#fsBtn').textContent = document.fullscreenElement ? '⤢' : '⛶';
-});
+function onFsChange() {
+  const on = !!(document.fullscreenElement || document.webkitFullscreenElement);
+  if (on) theater(false);   // 真全屏成了就别叠着网页全屏
+  $('#fsBtn').textContent = on ? '⤢' : '⛶';
+}
+document.addEventListener('fullscreenchange', onFsChange);
+// iPad / 旧版 Safari 只发带前缀的这个
+document.addEventListener('webkitfullscreenchange', onFsChange);
 // 换清晰度/换片会重建媒体，倍速要跟着带过去
 video.addEventListener('loadstart', () => {
   const r = parseFloat(localStorage.getItem('mf_rate') || '1');
