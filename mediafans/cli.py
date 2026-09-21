@@ -241,7 +241,7 @@ def doctor(offline: bool = typer.Option(False, "--offline", help="跳过网络�
         try:
             from .metadata.tmdb import TmdbClient
 
-            TmdbClient(str(tmdb_key)).trending("movie")
+            TmdbClient(str(tmdb_key), base_url=str(cfg.get("tmdb.base_url") or "")).trending("movie")
             add("TMDB 连通", True, "接口正常")
         except Exception as e:
             add("TMDB 连通", False, truncate(str(e), 90))
@@ -279,7 +279,8 @@ def discover(
 
     try:
         cfg = _cfg()
-        client = TmdbClient(str(cfg.require("tmdb.api_key", "discover 命令需要")))
+        client = TmdbClient(str(cfg.require("tmdb.api_key", "discover 命令需要")),
+                            base_url=str(cfg.get("tmdb.base_url") or ""))
         items = client.search(query) if query else client.trending(media_type)
     except MediaFansError as e:
         _fail(e)
@@ -619,7 +620,8 @@ def daily(
 
     try:
         cfg = _cfg()
-        client = TmdbClient(str(cfg.require("tmdb.api_key", "daily 命令需要")))
+        client = TmdbClient(str(cfg.require("tmdb.api_key", "daily 命令需要")),
+                            base_url=str(cfg.get("tmdb.base_url") or ""))
         items = {"airing": client.airing_today, "onair": client.on_the_air,
                  "popular": client.popular_tv}.get(kind, client.airing_today)()
     except MediaFansError as e:
@@ -664,11 +666,12 @@ def auto(
         # 有 TMDB 就拿总集数当完整度基准
         year, episodes = "", 0
         tmdb_key = str(cfg.get("tmdb.api_key") or "")
+        tmdb_base = str(cfg.get("tmdb.base_url") or "")
         if tmdb_key:
             try:
-                hits = TmdbClient(tmdb_key).search(name, "tv")
+                hits = TmdbClient(tmdb_key, base_url=tmdb_base).search(name, "tv")
                 if hits:
-                    detail = TmdbClient(tmdb_key).tv_detail(hits[0].tmdb_id)
+                    detail = TmdbClient(tmdb_key, base_url=tmdb_base).tv_detail(hits[0].tmdb_id)
                     from .agent import episode_yardstick
 
                     year = detail.get("year") or ""
@@ -763,6 +766,7 @@ def web(
                       baidu_token_path=baidu_token_file_for(cfg), token=token,
                       use_tv=not no_tv,
                       tmdb_key=str(cfg.get("tmdb.api_key") or ""),
+                      tmdb_base_url=str(cfg.get("tmdb.base_url") or ""),
                       picker=_picker(cfg),
                       watch_path=watch_file_for(cfg),
                       prefer_chinese=bool(cfg.get("tmdb.prefer_chinese", True)))

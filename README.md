@@ -795,6 +795,30 @@ ai:
 
 编译和安装见 [`androidtv/README.md`](androidtv/README.md)。
 
+## 部署在国内服务器上
+
+国内机器到夸克 CDN 的速度是境外的十倍以上（实测北京 6.5–7.3 MB/s 且稳定，
+新加坡 0.05–4 MB/s 且抖），播放卡顿是拓扑问题，换机器就是解法。但有一样反过来：
+**`api.themoviedb.org` 从国内不通**（`Network is unreachable`），而海报站
+`image.tmdb.org` 是通的。症状是海报能出、剧集页「读取失败」。
+
+解法是让境外那台当 TMDB 接口的中转，国内这台把 `tmdb.base_url` 指过去
+（`config.example.yaml` 里有注释）。境外 nginx 上一段：
+
+```nginx
+location /tmdb-<随机串>/ {
+    proxy_pass https://api.themoviedb.org/;
+    proxy_ssl_server_name on;
+    proxy_set_header Host api.themoviedb.org;
+}
+```
+
+秘密路径是为了别变成一个公开的 TMDB 代理；TMDB 自己还要 api_key，双保险。
+只有接口需要中转，海报不用——`poster_url` 永远指官方图片站。TMDB 请求都是小 JSON，
+绕一圈境外没什么开销（实测榜单命中缓存时零点几秒）。
+
+其它外部依赖（PanSou、AI 网关）本来就是走公网地址，从国内可达，不用动。
+
 ## 手机上的布局
 
 窄屏（≤820px）走另一套布局，因为原来的左右分栏在手机上是废的：左栏 `min-width:300px`，

@@ -20,12 +20,17 @@ class TmdbClient:
     # （《一人之下》动画 / 《异人之下》真人），这个 id 是最硬的区分依据。
     ANIMATION_GENRE = 16
 
-    def __init__(self, api_key: str, timeout: float = 15.0, transport=None):
+    def __init__(self, api_key: str, timeout: float = 15.0, transport=None,
+                 base_url: str = ""):
         if not api_key:
             raise ConfigError("未配置 tmdb.api_key（themoviedb.org 免费申请）")
         self.api_key = api_key.strip()
         self.timeout = timeout
         self.transport = transport
+        # 国内服务器到 api.themoviedb.org 不通（Network is unreachable），
+        # 而海报站 image.tmdb.org 是通的——所以只有接口需要中转，海报不用。
+        # base_url 指到一个能出去的反代（比如境外那台 nginx 上的一个秘密路径）。
+        self.base = (base_url or "").strip().rstrip("/") or self.BASE
 
     def _get(self, path: str, params: dict) -> List[dict]:
         params = dict(params or {})
@@ -36,7 +41,7 @@ class TmdbClient:
         else:
             params.setdefault("api_key", self.api_key)
         with httpx.Client(timeout=self.timeout, transport=self.transport) as c:
-            r = c.get(f"{self.BASE}{path}", params=params, headers=headers)
+            r = c.get(f"{self.base}{path}", params=params, headers=headers)
             r.raise_for_status()
             body = r.json()
         return body.get("results") or []
@@ -150,7 +155,7 @@ class TmdbClient:
         else:
             params["api_key"] = self.api_key
         with httpx.Client(timeout=self.timeout, transport=self.transport) as c:
-            r = c.get(f"{self.BASE}/movie/{int(tmdb_id)}", params=params, headers=headers)
+            r = c.get(f"{self.base}/movie/{int(tmdb_id)}", params=params, headers=headers)
             r.raise_for_status()
             body = r.json()
         genres = [int(g.get("id") or 0) for g in (body.get("genres") or [])]
@@ -201,7 +206,7 @@ class TmdbClient:
             params["api_key"] = self.api_key
         params["language"] = "zh-CN"
         with httpx.Client(timeout=self.timeout, transport=self.transport) as c:
-            r = c.get(f"{self.BASE}/tv/{int(tmdb_id)}", params=params, headers=headers)
+            r = c.get(f"{self.base}/tv/{int(tmdb_id)}", params=params, headers=headers)
             r.raise_for_status()
             body = r.json()
         seasons = [
@@ -234,7 +239,7 @@ class TmdbClient:
         else:
             params["api_key"] = self.api_key
         with httpx.Client(timeout=self.timeout, transport=self.transport) as c:
-            r = c.get(f"{self.BASE}/tv/{int(tmdb_id)}/season/{int(season)}",
+            r = c.get(f"{self.base}/tv/{int(tmdb_id)}/season/{int(season)}",
                       params=params, headers=headers)
             r.raise_for_status()
             body = r.json()

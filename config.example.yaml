@@ -4,6 +4,11 @@
 tmdb:
   # themoviedb.org 免费申请的 API Key（v3 key 或 v4 Bearer Token 均可）
   api_key: ""
+  # 国内服务器到 api.themoviedb.org 不通（Network is unreachable），海报站倒是通的。
+  # 把接口地址指到一个能出去的反代，比如境外机器 nginx 上的一个秘密路径：
+  #   location /tmdb-<随机串>/ { proxy_pass https://api.themoviedb.org/; ... }
+  # 填的是到 /3 为止的前缀。留空就直连官方。
+  # base_url: https://境外主机:端口/tmdb-<随机串>/3
   # 追剧榜和搜索优先华语内容。TMDB 的榜单是全球榜，被各国日播肥皂剧刷屏，
   # 华语基本挤不进去；关掉就是原样的全球榜。
   prefer_chinese: true

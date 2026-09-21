@@ -208,3 +208,30 @@ def test_config_get_honours_its_default():
     assert cfg.get("tmdb.prefer_chinese", True) is True
     assert cfg.get("tmdb.api_key", "fallback") == "k"
     assert cfg.get("完全没有的项") is None
+
+
+def test_tmdb_base_url_is_configurable():
+    """国内服务器到 api.themoviedb.org 不通，接口得能指到一个境外反代。
+
+    只有接口需要中转——海报站 image.tmdb.org 从国内是通的，poster_url 不受影响。
+    """
+    import httpx
+
+    from mediafans.metadata.tmdb import TmdbClient
+
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"results": []})
+
+    c = TmdbClient("k", transport=httpx.MockTransport(handler),
+                   base_url="https://relay.example/tmdb-abc/3/")
+    c.trending("movie")
+    assert seen[0].startswith("https://relay.example/tmdb-abc/3/trending/movie/week")
+    # 不填就直连官方
+    c2 = TmdbClient("k", transport=httpx.MockTransport(handler))
+    c2.trending("movie")
+    assert seen[1].startswith("https://api.themoviedb.org/3/trending/movie/week")
+    # 海报永远走官方图片站
+    assert TmdbClient.poster_url("/x.jpg").startswith("https://image.tmdb.org/")

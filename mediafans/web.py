@@ -140,7 +140,7 @@ class WebApp:
                  baidu_token_path: Optional[Path] = None,
                  baidu_oauth_cfg: Optional[dict] = None,
                  token: str = "", use_tv: bool = True,
-                 tmdb_key: str = "", picker=None,
+                 tmdb_key: str = "", tmdb_base_url: str = "", picker=None,
                  watch_path: Optional[Path] = None,
                  prefer_chinese: bool = True):
         # drive_factory(nd) -> BaseDrive，按网盘建驱动（nd: quark | baidu）
@@ -161,6 +161,7 @@ class WebApp:
         self.baidu_oauth_cfg = dict(baidu_oauth_cfg or {})
         self.use_tv = use_tv
         self.tmdb_key = tmdb_key or ""
+        self.tmdb_base_url = tmdb_base_url or ""
         # 追剧榜和搜索都优先华语内容（config: tmdb.prefer_chinese）
         self.prefer_chinese = bool(prefer_chinese)
         self.picker = picker
@@ -497,7 +498,7 @@ class WebApp:
         if self._tmdb is None and self.tmdb_key:
             from .metadata.tmdb import TmdbClient
 
-            self._tmdb = TmdbClient(self.tmdb_key)
+            self._tmdb = TmdbClient(self.tmdb_key, base_url=self.tmdb_base_url)
         return self._tmdb
 
     # 榜单：剧集三档 + 电影三档。值是 (华语档参数, 全球榜端点名, media_type)
