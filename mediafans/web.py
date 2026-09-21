@@ -1339,10 +1339,11 @@ PAGE_HTML = r"""<!doctype html>
   body.rot90 #stage { position:fixed; top:0; left:0; z-index:50; border-radius:0;
                       width:100vh; width:100dvh; height:100vw; height:100dvw;
                       transform:rotate(90deg) translate(0, -100%); transform-origin:0 0; }
-  /* 横竖屏切换：只在手机的全屏/网页全屏里出现，桌面上没意义 */
+  /* ⟳ 网页横屏：手机上只要有视频就显示（它是 iPhone 上带自定义控制条的唯一横屏入口），
+     桌面上没意义 */
   #rotBtn { display:none; }
   @media (pointer: coarse) {
-    body.theater #rotBtn, body.rot90 #rotBtn, #stage:fullscreen #rotBtn { display:inline-block; }
+    body.has-video #rotBtn { display:inline-block; }
   }
   #video { width:100%; height:100%; flex:1; min-height:0; background:#000; outline:none;
            /* 亮度手势调的是画面本身——浏览器没有调系统背光的 API */
@@ -1879,7 +1880,7 @@ PAGE_HTML = r"""<!doctype html>
           <option value="1.75">1.75×</option>
           <option value="2">2.0×</option>
         </select>
-        <button id="rotBtn" onclick="toggleOrientation()" title="横屏 / 竖屏">⟳</button>
+        <button id="rotBtn" onclick="toggleOrientation()" title="网页横屏 / 回来">⟳</button>
         <button id="fsBtn" onclick="toggleFullscreen()" title="全屏（f）">⛶</button>
       </div>
     </div>
@@ -2674,10 +2675,15 @@ function toggleFullscreen() {
   if (video.webkitDisplayingFullscreen) { video.webkitExitFullscreen(); return; }
   if (document.body.classList.contains('theater')) { theater(false); return; }
 
-  // iPhone：不走系统全屏了，改成网页全屏 + CSS 横屏。系统全屏里用的是 iOS 自带
-  // 控制条，我们的悬浮控制条、手势、横竖屏切换按钮在里面全都放不进去；
-  // 而「全屏后横屏 + 能切回竖屏」正是用户要的。代价是少了 AirPlay 那些系统功能。
-  if (iosNativeFullscreen()) { theater(true); return; }
+  // iPhone：⛶ 进系统全屏（iOS 自带播放器，跟着设备自动转横屏，有 AirPlay）。
+  // 它里面放不进我们的控制条和手势，所以「网页横屏」单独给了 ⟳ 这个入口。
+  // 必须在点击的同步调用栈里调，塞进 Promise.catch 会丢掉用户手势被 iOS 拒绝；
+  // 元数据没加载完时它抛 InvalidStateError，那就退化成网页全屏。
+  if (iosNativeFullscreen()) {
+    try { video.webkitEnterFullscreen(); return; } catch (e) {}
+    theater(true);
+    return;
+  }
   // 真全屏要浏览器给权限（需要用户手势，嵌入式/受限环境可能直接拒绝）。
   // 拒绝了就退化成铺满窗口的网页全屏，至少不能点了没反应。
   const req = stage.requestFullscreen || stage.webkitRequestFullscreen;
@@ -2721,9 +2727,16 @@ async function applyOrientation() {
   $('#rotBtn').textContent = wantLandscape ? '⟳' : '⟲';
 }
 
+// ⟳ 的两种语义：
+//   - 在真全屏里（Android）：横/竖锁定之间切。
+//   - 不在真全屏里：进/出「网页横屏」——网页全屏 + CSS 转 90°，带我们的控制条和手势。
+//     这是 iPhone 上唯一能带自定义控制条的横屏方式（它的系统全屏里放不进去）。
 function toggleOrientation() {
-  wantLandscape = !wantLandscape;
-  applyOrientation();
+  const realFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+  if (realFs) { wantLandscape = !wantLandscape; applyOrientation(); return; }
+  if (isRotated() || document.body.classList.contains('theater')) { theater(false); return; }
+  wantLandscape = true;
+  theater(true);
 }
 // 用户物理转动手机时重新算一次（CSS 假横屏只对竖持有意义）
 addEventListener('resize', () => { if (inAnyFullscreen()) applyOrientation(); });

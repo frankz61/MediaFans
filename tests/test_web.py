@@ -1436,10 +1436,16 @@ def test_mobile_fullscreen_goes_landscape_with_a_toggle():
     assert "screen.orientation.lock(wantLandscape ? 'landscape' : 'portrait')" in body
     assert "classList.toggle('rot90'" in body            # 锁不了就 CSS 转
     assert 'id="rotBtn"' in PAGE_HTML and "function toggleOrientation" in PAGE_HTML
-    # iPhone 走网页全屏 + CSS 横屏，不再调 webkitEnterFullscreen
+    # iPhone 的 ⛶ 是系统全屏（真全屏、跟着设备转、有 AirPlay），
+    # 必须在点击的同步栈里调——塞进 Promise.catch 会丢掉用户手势被拒
     tf = _js_fn("toggleFullscreen")
-    assert "if (iosNativeFullscreen()) { theater(true); return; }" in tf
-    assert "video.webkitEnterFullscreen()" not in tf
+    assert tf.index("video.webkitEnterFullscreen()") < tf.index("Promise.resolve(p)")
+    # 「网页横屏」是 ⟳ 的独立入口：iPhone 系统全屏里放不进自定义控制条，
+    # 想要手势和横竖切换就走这条
+    to = _js_fn("toggleOrientation")
+    assert "theater(true)" in to and "theater(false)" in to
+    from mediafans.web import PAGE_HTML as _P
+    assert "body.has-video #rotBtn { display:inline-block; }" in _P
     # 转了 90° 之后进度条和手势的坐标系也得跟着转，否则拖不动、滑反了
     assert "isRotated()" in _js_fn("seekToEvent")
     css = PAGE_HTML.split("body.rot90 #stage")[1].split("}")[0]
