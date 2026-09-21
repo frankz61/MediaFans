@@ -1370,8 +1370,9 @@ def _js_fn(name: str) -> str:
 
     from mediafans.web import PAGE_HTML
 
-    m = re.search(r"^function " + name + r"\(.*?(?=^function )", PAGE_HTML,
-                  re.S | re.M)
+    # async function 也得能抠出来
+    m = re.search(r"^(?:async )?function " + name + r"\(.*?(?=^(?:async )?function )",
+                  PAGE_HTML, re.S | re.M)
     assert m, f"页面里没有 {name}()"
     return m.group(0)
 
@@ -1420,21 +1421,24 @@ def test_poster_grid_pins_row_height_to_content():
     assert "aspect-ratio:2/3" in PAGE_HTML.replace(" ", "")
 
 
-def test_iphone_uses_native_video_fullscreen():
-    """iPhone 的 Safari 不支持 Element.requestFullscreen，只有 <video> 能进系统全屏。
+def test_mobile_fullscreen_goes_landscape_with_a_toggle():
+    """手机全屏默认横屏，且能切回竖屏。
 
-    之前的逻辑在 iPhone 上退化成「网页全屏」：地址栏和底栏都还在、也不会横屏，
-    用户看到的就是「全屏没反应」。iPad 和桌面浏览器仍走标准接口。
+    两条路：Android 真全屏用 screen.orientation.lock；iPhone 不给锁方向，
+    只能用 CSS 把播放区转 90°（body.rot90）——也正因为如此 iPhone 不再走系统全屏：
+    系统全屏里放不进我们的控制条和横竖屏按钮。
     """
-    body = _js_fn("toggleFullscreen")
-    assert "video.webkitEnterFullscreen()" in body
-    # 必须在点击的同步调用栈里调：塞进 Promise.catch 会丢掉用户手势，被 iOS 拒绝
-    ios_call = body.index("video.webkitEnterFullscreen()")
-    promise = body.index("Promise.resolve(p)")
-    assert ios_call < promise
-    # iOS 系统全屏不触发 fullscreenchange，得听 video 自己的事件
     from mediafans.web import PAGE_HTML
 
-    assert "'webkitbeginfullscreen'" in PAGE_HTML and "'webkitendfullscreen'" in PAGE_HTML
-    # iPad / 旧 Safari 只发带前缀的 change 事件
-    assert "'webkitfullscreenchange'" in PAGE_HTML
+    body = _js_fn("applyOrientation")
+    assert "screen.orientation.lock(wantLandscape ? 'landscape' : 'portrait')" in body
+    assert "classList.toggle('rot90'" in body            # 锁不了就 CSS 转
+    assert 'id="rotBtn"' in PAGE_HTML and "function toggleOrientation" in PAGE_HTML
+    # iPhone 走网页全屏 + CSS 横屏，不再调 webkitEnterFullscreen
+    tf = _js_fn("toggleFullscreen")
+    assert "if (iosNativeFullscreen()) { theater(true); return; }" in tf
+    assert "video.webkitEnterFullscreen()" not in tf
+    # 转了 90° 之后进度条和手势的坐标系也得跟着转，否则拖不动、滑反了
+    assert "isRotated()" in _js_fn("seekToEvent")
+    css = PAGE_HTML.split("body.rot90 #stage")[1].split("}")[0]
+    assert "rotate(90deg)" in css and "100dvh" in css and "100dvw" in css

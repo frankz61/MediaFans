@@ -514,21 +514,22 @@ E01-E05 2160p / E06 掉到 1080p / E07 存了两份。而且 27 集意味着开 
 **亮度是画面亮度，不是屏幕背光**——浏览器没有调背光的 API，能做的只有对 video 加
 `filter: brightness()`。观感接近，但只影响视频区，环境光很强时不如真背光。
 
-**iPhone 上的全屏走的是另一条路。** iPhone 的 Safari 不支持 `Element.requestFullscreen`
-（iPad 和桌面都支持），只允许 `<video>` 自己进系统全屏：`video.webkitEnterFullscreen()`。
-之前的逻辑在 iPhone 上退化成「网页全屏」——地址栏和底栏都还在、也不会横屏，
-看起来就是「全屏没反应」。
+**手机全屏默认横屏，⟳ 按钮切横竖。** 两条路：
 
-三个细节都是 iOS 特有的：
+- **Android 真全屏**：`screen.orientation.lock('landscape')`。它要求已经在全屏里，
+  所以挂在 `requestFullscreen` 的 then 里；退出时 `unlock()`。
+- **iPhone**：Safari 不支持 `Element.requestFullscreen`，也不给锁方向。唯一的办法是
+  **CSS 把播放区转 90°**（`body.rot90`）：宽高对调后绕左上角顺时针转，再沿自身高度
+  上移，正好落回视口；用户把手机逆时针转过来看，画面就是正的。B 站 H5 那类站
+  就是这么做的。锁方向失败的 Android 浏览器也退到这条。
 
-- 必须在点击的**同步调用栈**里调。塞进 `Promise.catch` 里会丢掉用户手势，被 iOS 拒绝。
-- 系统全屏不触发 `fullscreenchange`，得听 video 自己的 `webkitbeginfullscreen` /
-  `webkitendfullscreen`。
-- 退出系统全屏时 iOS 会顺手把视频暂停。用户是想回小窗接着看，不是想停，
-  所以在 `webkitendfullscreen` 里试着续播。
+转了 90° 之后**坐标系跟着转**，这一点最容易漏：进度条在屏幕上是竖着的，
+画面左端落在屏幕顶端，所以拖动要沿屏幕 y 轴算比例；手势里用户眼里的「上」
+是屏幕的 +x，画面的左半边是屏幕的上半边。不改这两处的话拖不动、滑反了。
 
-代价是进了系统全屏用的是 iOS 自带的控制条——上面那套悬浮控制条、手势、
-亮度调节在里面都不生效。这是平台限制，换来的是真正的全屏和横屏。
+iPhone 因此**不再走系统全屏**（`webkitEnterFullscreen`）：系统全屏里用的是 iOS 自带的
+控制条，我们的悬浮控制条、手势、横竖屏按钮全都放不进去。代价是少了 AirPlay 那些
+系统功能——要的话可以另加一个按钮单独进系统播放器。
 
 ### 死链很多，所以分批探、够用就停
 

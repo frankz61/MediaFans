@@ -1292,6 +1292,20 @@ PAGE_HTML = r"""<!doctype html>
   body.theater > header, body.theater #browser { display:none; }
   body.theater #player { padding:0; }
   body.theater #stage { border-radius:0; }
+  /* 手机竖持时用 CSS 把播放区转成横屏。iPhone 不给锁方向，这是唯一能让
+     自定义控制条和手势留在横屏画面里的办法；Android 真全屏能锁方向时用锁，
+     锁不了也退到这条。宽高对调后绕左上角顺时针转 90°，再沿自身高度上移，
+     正好落回视口——用户把手机逆时针转过来看，画面就是正的。 */
+  body.rot90 > header, body.rot90 #browser { display:none; }
+  body.rot90 #player { padding:0; }
+  body.rot90 #stage { position:fixed; top:0; left:0; z-index:50; border-radius:0;
+                      width:100vh; width:100dvh; height:100vw; height:100dvw;
+                      transform:rotate(90deg) translate(0, -100%); transform-origin:0 0; }
+  /* 横竖屏切换：只在手机的全屏/网页全屏里出现，桌面上没意义 */
+  #rotBtn { display:none; }
+  @media (pointer: coarse) {
+    body.theater #rotBtn, body.rot90 #rotBtn, #stage:fullscreen #rotBtn { display:inline-block; }
+  }
   #video { width:100%; height:100%; flex:1; min-height:0; background:#000; outline:none;
            /* 亮度手势调的是画面本身——浏览器没有调系统背光的 API */
            transition:filter .1s linear; }
@@ -1818,6 +1832,7 @@ PAGE_HTML = r"""<!doctype html>
           <option value="1.75">1.75×</option>
           <option value="2">2.0×</option>
         </select>
+        <button id="rotBtn" onclick="toggleOrientation()" title="横屏 / 竖屏">⟳</button>
         <button id="fsBtn" onclick="toggleFullscreen()" title="全屏（f）">⛶</button>
       </div>
     </div>
@@ -2438,6 +2453,7 @@ function setRate(r) {
 function theater(on) {
   document.body.classList.toggle('theater', on);
   $('#fsBtn').textContent = on ? '⤢' : '⛶';
+  applyOrientation();
 }
 
 // ---------------- 控制条自动隐藏 ----------------
@@ -2507,9 +2523,14 @@ stage.addEventListener('pointerdown', e => {
   if (e.target.closest('#ctrl')) return;      // 控制条自己有拖拽逻辑
   if (!video.src) return;
   const r = stage.getBoundingClientRect();
+  // CSS 假横屏时坐标系跟着转：用户眼里的「上」是屏幕的 +x，
+  // 画面的左半边是屏幕的上半边（推导见 body.rot90 的 CSS 注释）
+  const rot = isRotated();
   g = {
-    id: e.pointerId, x: e.clientX, y: e.clientY, h: r.height || 1,
-    side: (e.clientX - r.left) < r.width / 2 ? 'bright' : 'vol',
+    id: e.pointerId, x: e.clientX, y: e.clientY, rot,
+    h: (rot ? r.width : r.height) || 1,
+    side: rot ? ((e.clientY - r.top) < r.height / 2 ? 'bright' : 'vol')
+              : ((e.clientX - r.left) < r.width / 2 ? 'bright' : 'vol'),
     startBright: bright, startVol: video.muted ? 0 : video.volume,
     moved: false,
   };
@@ -2517,7 +2538,7 @@ stage.addEventListener('pointerdown', e => {
 
 stage.addEventListener('pointermove', e => {
   if (!g || e.pointerId !== g.id) return;
-  const dy = g.y - e.clientY;                 // 上滑为正
+  const dy = g.rot ? (e.clientX - g.x) : (g.y - e.clientY);   // 上滑为正
   if (!g.moved && Math.abs(dy) < GESTURE_SLOP) return;
   if (!g.moved) {
     g.moved = true;
@@ -2573,21 +2594,59 @@ function toggleFullscreen() {
   if (video.webkitDisplayingFullscreen) { video.webkitExitFullscreen(); return; }
   if (document.body.classList.contains('theater')) { theater(false); return; }
 
-  if (iosNativeFullscreen()) {
-    // 必须在点击的同步调用栈里调，塞进 Promise.catch 里会丢掉用户手势，被 iOS 拒绝。
-    // 元数据没加载完时它会抛 InvalidStateError，那就先退化成网页全屏。
-    try { video.webkitEnterFullscreen(); return; } catch (e) {}
-    theater(true);
-    return;
-  }
+  // iPhone：不走系统全屏了，改成网页全屏 + CSS 横屏。系统全屏里用的是 iOS 自带
+  // 控制条，我们的悬浮控制条、手势、横竖屏切换按钮在里面全都放不进去；
+  // 而「全屏后横屏 + 能切回竖屏」正是用户要的。代价是少了 AirPlay 那些系统功能。
+  if (iosNativeFullscreen()) { theater(true); return; }
   // 真全屏要浏览器给权限（需要用户手势，嵌入式/受限环境可能直接拒绝）。
   // 拒绝了就退化成铺满窗口的网页全屏，至少不能点了没反应。
   const req = stage.requestFullscreen || stage.webkitRequestFullscreen;
   let p;
   try { p = req ? req.call(stage) : Promise.reject(); }
   catch (e) { p = Promise.reject(e); }
-  Promise.resolve(p).catch(() => theater(true));
+  Promise.resolve(p).then(applyOrientation).catch(() => theater(true));
 }
+
+// ---------------- 手机全屏：默认横屏，可切竖屏 ----------------
+// 两条路：Android 真全屏能 screen.orientation.lock；iPhone 不给锁方向，
+// 只能用 CSS 把播放区转 90°（body.rot90）。锁不成功也退到 CSS 那条。
+const coarsePointer = matchMedia('(pointer: coarse)').matches;
+let wantLandscape = true;      // 进全屏默认横屏；按 ⟳ 在横竖之间切
+
+function isRotated() { return document.body.classList.contains('rot90'); }
+function inAnyFullscreen() {
+  return !!(document.fullscreenElement || document.webkitFullscreenElement)
+      || document.body.classList.contains('theater');
+}
+
+async function applyOrientation() {
+  if (!coarsePointer || !inAnyFullscreen()) {
+    document.body.classList.remove('rot90');
+    if (screen.orientation && screen.orientation.unlock) {
+      try { screen.orientation.unlock(); } catch (e) {}
+    }
+    return;
+  }
+  const realFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+  if (realFs && screen.orientation && screen.orientation.lock) {
+    try {
+      await screen.orientation.lock(wantLandscape ? 'landscape' : 'portrait');
+      document.body.classList.remove('rot90');
+      return;
+    } catch (e) { /* 锁不了（iPad、部分浏览器）就用 CSS 转 */ }
+  }
+  // CSS 假横屏只在设备物理竖持时才需要；用户自己把手机转过去了就别再转一遍
+  const portraitNow = innerHeight > innerWidth;
+  document.body.classList.toggle('rot90', wantLandscape && portraitNow);
+  $('#rotBtn').textContent = wantLandscape ? '⟳' : '⟲';
+}
+
+function toggleOrientation() {
+  wantLandscape = !wantLandscape;
+  applyOrientation();
+}
+// 用户物理转动手机时重新算一次（CSS 假横屏只对竖持有意义）
+addEventListener('resize', () => { if (inAnyFullscreen()) applyOrientation(); });
 
 // iOS 系统全屏不触发 fullscreenchange，得听 video 自己的这两个事件
 video.addEventListener('webkitbeginfullscreen', () => {
@@ -2637,7 +2696,11 @@ function seekToEvent(e) {
   const d = duration();
   if (!d) return;
   const r = trackWrap.getBoundingClientRect();
-  const ratio = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
+  // CSS 假横屏时整个播放区转了 90°：进度条在屏幕上是竖着的，
+  // 画面的左端落在屏幕顶端，所以沿屏幕 y 轴算比例
+  const ratio = isRotated()
+    ? Math.max(0, Math.min(1, (e.clientY - r.top) / r.height))
+    : Math.max(0, Math.min(1, (e.clientX - r.left) / r.width));
   video.currentTime = ratio * d;
   paintProgress();
 }
@@ -2672,8 +2735,9 @@ video.addEventListener('pause', () => { $('#playBtn').textContent = '▶'; });
 video.addEventListener('ratechange', () => { $('#rate').value = String(video.playbackRate); });
 function onFsChange() {
   const on = !!(document.fullscreenElement || document.webkitFullscreenElement);
-  if (on) theater(false);   // 真全屏成了就别叠着网页全屏
+  if (on) document.body.classList.remove('theater');   // 真全屏成了就别叠着网页全屏
   $('#fsBtn').textContent = on ? '⤢' : '⛶';
+  applyOrientation();     // 进：锁横屏；出：解锁 + 去掉 CSS 旋转
 }
 document.addEventListener('fullscreenchange', onFsChange);
 // iPad / 旧版 Safari 只发带前缀的这个
