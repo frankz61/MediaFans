@@ -4,6 +4,7 @@ import base64
 import dataclasses
 import io
 import json
+import hashlib
 import threading
 import time
 from collections import OrderedDict
@@ -180,6 +181,8 @@ class WebApp:
         self.watch = WatchStore(Path(watch_path) if watch_path
                                 else Path.home() / ".mediafans" / "watch.json")
         self._drives: dict = {}
+        self._discover_cache: dict = {}      # kind -> (ts, result)
+        self._discover_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._server = QuietThreadingHTTPServer((host, port), self._make_handler())
 
@@ -507,6 +510,10 @@ class WebApp:
         "hot": ("hot", "popular_movie", "movie"),
     }
 
+    # 榜单缓存多久。榜单一天变不了几次，而每次首屏都要为它打两趟 TMDB
+    # （华语一档 + 全球一档），是首屏最慢的一段。10 分钟内重复打开直接给缓存。
+    DISCOVER_TTL = 600.0
+
     def api_discover(self, kind: str = "airing") -> dict:
         """榜单，华语在前。剧集和电影共用一个端点，靠 kind 分。
 
@@ -516,6 +523,17 @@ class WebApp:
         """
         if not self.tmdb:
             raise MediaFansError("未配置 tmdb.api_key，无法拉取榜单")
+        now = time.time()
+        with self._discover_lock:
+            hit = self._discover_cache.get(kind)
+            if hit and now - hit[0] < self.DISCOVER_TTL:
+                return dict(hit[1], cached=True)
+        result = self._discover_fresh(kind)
+        with self._discover_lock:
+            self._discover_cache[kind] = (now, result)
+        return dict(result, cached=False)
+
+    def _discover_fresh(self, kind: str) -> dict:
         cn_kind, global_fn, media = self.DISCOVER.get(kind) or self.DISCOVER["airing"]
         chinese_fn = self.tmdb.chinese_movie if media == "movie" else self.tmdb.chinese_tv
         fn = getattr(self.tmdb, global_fn)
@@ -1086,18 +1104,38 @@ class WebApp:
                 return "MediaFansWeb/1.0"
 
             def _send(self, status: int, body: bytes, content_type: str,
-                      extra_headers=None) -> None:
+                      extra_headers=None, cache: str = "no-store, must-revalidate") -> None:
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
-                # 页面的 JS 是内联的，每次部署都变；不禁缓存的话浏览器会按
-                # 启发式缓存一直跑旧代码，看起来就像「部署了但没生效」。
-                # 接口返回的是网盘现状和播放进度，也没有一条该被缓存。
-                self.send_header("Cache-Control", "no-store, must-revalidate")
+                # 接口返回的是网盘现状和播放进度，没有一条该被缓存，默认 no-store。
+                # 页面本身另算，见 _send_page。
+                self.send_header("Cache-Control", cache)
                 for name, value in (extra_headers or []):
                     self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _send_page(self, extra_headers=None) -> None:
+                """发页面：带 ETag，浏览器每次问一下、没变就 304。
+
+                页面的 JS 是内联的、100KB 上下，每次部署都变。以前一刀切 no-store
+                ——因为不禁缓存的话浏览器按启发式缓存会一直跑旧代码，看起来像
+                「部署了但没生效」。但 no-store 的代价是每次打开都重新下 100KB，
+                手机上首屏明显慢一截。no-cache + ETag 两头都占：每次都校验
+                （新版本立刻生效），没变就 304（一个几十字节的往返）。
+                """
+                if self.headers.get("If-None-Match") == PAGE_ETAG:
+                    self.send_response(304)
+                    self.send_header("ETag", PAGE_ETAG)
+                    self.send_header("Cache-Control", "no-cache")
+                    for name, value in (extra_headers or []):
+                        self.send_header(name, value)
+                    self.end_headers()
+                    return
+                self._send(200, PAGE_BYTES, "text/html; charset=utf-8",
+                           [("ETag", PAGE_ETAG)] + list(extra_headers or []),
+                           cache="no-cache")
 
             def _json(self, status: int, payload: dict) -> None:
                 self._send(status, json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -1149,8 +1187,7 @@ class WebApp:
                         if app.token and query.get("token") == app.token:
                             extra = [("Set-Cookie",
                                       f"mf_token={app.token}; Path=/; SameSite=Lax; Max-Age=604800")]
-                        self._send(200, PAGE_HTML.encode("utf-8"),
-                                   "text/html; charset=utf-8", extra)
+                        self._send_page(extra)
                     elif parsed.path == "/api/list":
                         self._json(200, app.api_list(query.get("path", ""),
                                                      query.get("nd", "quark")))
@@ -1379,6 +1416,15 @@ PAGE_HTML = r"""<!doctype html>
   #meta .title { font-size:15px; font-weight:600; word-break:break-all; }
   #meta .sub { color:var(--dim); font-size:12px; }
   #hint { color:var(--dim); font-size:12px; padding:6px 4px; }
+  /* 防呆：有请求在飞时，会触发新请求的入口一律不可点。
+     手机上「点了没反应就再点一下」是本能，两次点击会开两个 /api/play，
+     后一个还可能把前一个的结果盖掉。顶部的细条告诉用户「在忙，别点了」。 */
+  #loadbar { position:fixed; top:0; left:0; height:3px; width:0; background:var(--accent);
+             z-index:99; opacity:0; transition:width .4s ease-out, opacity .2s; pointer-events:none; }
+  body.busy #loadbar { opacity:1; width:70%; }
+  body.busy .card, body.busy #epList .pill, body.busy #navbar button,
+  body.busy #sources .sbtn, body.busy #quality .qbtn, body.busy .wrow, body.busy #files .row
+    { pointer-events:none; opacity:.55; }
   #hint.error { color:#ff7a7a; }
   .empty { color:var(--dim); text-align:center; padding:30px 0; }
   /* 剧集：一个独立标签页，不是弹层——看剧时它是主界面，不该盖住播放器 */
@@ -1836,6 +1882,7 @@ PAGE_HTML = r"""<!doctype html>
         <button id="fsBtn" onclick="toggleFullscreen()" title="全屏（f）">⛶</button>
       </div>
     </div>
+    <div id="loadbar"></div>
     <div id="quality"></div>
     <div id="sources"></div>
     <div id="navbar" style="display:none">
@@ -2091,6 +2138,7 @@ function renderPlaylist() {
 }
 
 function playAdjacent(delta) {
+  if (inflight > 0) return;          // 直链还没取回来，再按一次只会开第二个请求
   const eps = episodeNav();
   if (eps) {
     const target = delta > 0 ? eps.next : eps.prev;
@@ -2183,7 +2231,33 @@ function nextBestCopy() {
   return others.find(c => !risky(c)) || others[0] || null;
 }
 
+// ---------------- 防呆：忙碌态 ----------------
+// 有请求在飞时把会触发新请求的入口全部锁住（CSS 里 body.busy 那组），
+// 顶部一条细进度条提示。计数而不是布尔：两个不相干的请求可以同时在飞。
+let inflight = 0;
+function busy(on) {
+  inflight = Math.max(0, inflight + (on ? 1 : -1));
+  document.body.classList.toggle('busy', inflight > 0);
+}
+
+// 本地缓存：首屏先把上次的内容画出来，再去后台刷新（stale-while-revalidate）。
+// 榜单和最近观看都是「先看到再说」的东西，等 TMDB 那两趟请求回来再画，
+// 手机上首屏会空白一两秒。缓存只当占位，刷新回来一定覆盖。
+function cacheGet(key) {
+  try { return JSON.parse(localStorage.getItem('mf_c_' + key) || 'null'); } catch (e) { return null; }
+}
+function cachePut(key, value) {
+  try { localStorage.setItem('mf_c_' + key, JSON.stringify(value)); } catch (e) {}
+}
+
+// 同一个路径已经在取直链了就别再发一次；换了路径则新的为准、旧的结果丢弃
+let playSeq = 0, playInFlightPath = '';
+
 async function playFile(f) {
+  if (playInFlightPath && playInFlightPath === f.path) return;   // 连点同一个
+  const seq = ++playSeq;
+  playInFlightPath = f.path;
+  busy(true);
   // 从目录/播放列表点开的是散片，把剧集上下文清掉，免得进度记到别的剧上
   if (!f.keepCtx) playCtx = null;
   curCopies = f.copies || [];
@@ -2194,6 +2268,7 @@ async function playFile(f) {
     const r = await fetch('/api/play?path=' + encodeURIComponent(f.path)
                           + '&nd=' + curPlayNd);
     const data = await r.json();
+    if (seq !== playSeq) return;                    // 期间又点了别的，这次作废
     if (data.error) throw new Error(data.error);
     $('#title').textContent = data.file_name;
     $('#sub').textContent = f.size_h || '';
@@ -2208,9 +2283,13 @@ async function playFile(f) {
     hint.textContent = describe(data, pick)
       + (at ? '　（从上次的 ' + fmtTime(at) + ' 继续）' : '');
   } catch (e) {
+    if (seq !== playSeq) return;
     reportError(e.message, curPlayNd);
     hint.className = 'error';
     hint.textContent = '播放失败：' + e.message;
+  } finally {
+    // 只有最后一次请求负责释放忙碌态；被更新的请求作废的那次不动它
+    if (seq === playSeq) { playInFlightPath = ''; busy(false); }
   }
 }
 
@@ -2805,14 +2884,23 @@ function stepRate(delta) {
 }
 
 // ---------------- 最近观看 ----------------
+function paintWatch(items) {
+  const box = $('#watchList');
+  box.innerHTML = '';
+  for (const m of items) box.appendChild(watchRow(m));
+}
+
 async function renderWatch() {
   const box = $('#watchList');
+  const cached = cacheGet('recent');
+  if (cached && cached.length) paintWatch(cached);
   let items = [];
   try {
     const d = await (await fetch('/api/watch/recent?limit=20')).json();
     items = d.items || [];
+    cachePut('recent', items);
   } catch (e) {
-    box.innerHTML = '<div class="empty">读取失败：' + e.message + '</div>';
+    if (!cached) box.innerHTML = '<div class="empty">读取失败：' + e.message + '</div>';
     return;
   }
   if (!items.length) {
@@ -2820,8 +2908,7 @@ async function renderWatch() {
       + '<span class="dim">看过的会自动出现在这里，换个设备也能接着看</span></div>';
     return;
   }
-  box.innerHTML = '';
-  for (const m of items) box.appendChild(watchRow(m));
+  paintWatch(items);
 }
 
 function watchRow(m) {
@@ -3192,16 +3279,24 @@ async function loadShows(kind) {
   document.querySelectorAll('#kindSeg .seg, #segFound').forEach(b =>
     b.classList.toggle('on', b.dataset.kind === kind));
   const box = $('#shows');
-  box.innerHTML = '<div class="empty">加载中…</div>';
+  // 上次的先画上，用户立刻有东西看；后台刷新回来再覆盖
+  const cached = cacheGet('discover_' + kind);
+  if (cached && cached.items && cached.items.length) renderCards(cached.items, cached.note);
+  else box.innerHTML = '<div class="empty">加载中…</div>';
+  busy(true);
   try {
     const data = await (await fetch('/api/discover?kind=' + kind)).json();
     if (seq !== showsSeq) return;
     if (data.error) throw new Error(data.error);
     if (!data.items.length) { box.innerHTML = '<div class="empty">没有数据</div>'; return; }
+    cachePut('discover_' + kind, { items: data.items, note: data.note });
     renderCards(data.items, data.note);
   } catch (e) {
     if (seq !== showsSeq) return;
-    box.innerHTML = '<div class="empty">加载失败：' + e.message + '</div>';
+    // 有缓存就留着缓存，别用一条错误把已经画好的榜单冲掉
+    if (!cached) box.innerHTML = '<div class="empty">加载失败：' + e.message + '</div>';
+  } finally {
+    if (seq === showsSeq) busy(false);
   }
 }
 
@@ -3409,21 +3504,30 @@ async function openSeriesAt(mark, episode) {
   }
 }
 
+let seasonSeq = 0;
+
 async function loadSeason(tmdbId, season, refresh, media) {
   media = media || (series && series.media) || 'tv';
+  // 连点两部剧（或快速切季），慢的那个后回来会把快的盖掉——按序号只认最后一次
+  const seq = ++seasonSeq;
   series = { tmdb_id: tmdbId, season, media };
   $('#epList').innerHTML = '<div class="empty">读取中…</div>';
+  busy(true);
   try {
     const qs = `tmdb_id=${tmdbId}&season=${season}&nd=${curNd}&media=${media}`
              + (refresh ? '&refresh=1' : '');
     const d = await (await fetch('/api/series?' + qs)).json();
+    if (seq !== seasonSeq) return;
     if (d.error) throw new Error(d.error);
     series.data = d;
     renderSeasons(d);
     renderEpisodes(d);
   } catch (e) {
+    if (seq !== seasonSeq) return;
     reportError(e.message, curNd);
     $('#epList').innerHTML = '<div class="empty">读取失败：' + e.message + '</div>';
+  } finally {
+    if (seq === seasonSeq) busy(false);
   }
 }
 
@@ -3888,3 +3992,9 @@ function pollLogin(sid) {
 </body>
 </html>
 """
+
+# 页面字节和 ETag 在导入时算一次。内容变了 ETag 就变，浏览器下次校验拿到 200；
+# 没变就 304。用 sha1 的前 16 位足够——这不是防碰撞，是「变没变」。
+PAGE_BYTES = PAGE_HTML.encode("utf-8")
+PAGE_ETAG = '"' + hashlib.sha1(PAGE_BYTES).hexdigest()[:16] + '"'
+

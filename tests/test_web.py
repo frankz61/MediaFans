@@ -892,16 +892,18 @@ def test_page_auto_next_prefers_next_episode():
 
 
 def test_pages_and_apis_are_not_cached(upstream_url):
-    """页面的 JS 是内联的，每次部署都变。
+    """页面的 JS 是内联的，每次部署都变——绝不能让浏览器按启发式缓存跑旧代码。
 
-    不禁缓存的话浏览器会按启发式缓存一直跑旧代码，看起来就像「部署了但没生效」。
+    页面走 no-cache（每次校验、ETag 没变才 304），接口走 no-store。
+    两者都满足「部署了立刻生效」，区别只是页面没变时省掉 100KB。
     """
     app = make_webapp(upstream_url)
     base = f"http://127.0.0.1:{app.port}"
     try:
-        for path in ("/", "/api/list?path=/"):
-            r = httpx.get(base + path, timeout=10)
-            assert "no-store" in r.headers.get("cache-control", ""), path
+        r = httpx.get(base + "/", timeout=10)
+        assert r.headers.get("cache-control") == "no-cache"
+        r = httpx.get(base + "/api/list?path=/", timeout=10)
+        assert "no-store" in r.headers.get("cache-control", "")
     finally:
         app.stop()
 
@@ -1442,3 +1444,67 @@ def test_mobile_fullscreen_goes_landscape_with_a_toggle():
     assert "isRotated()" in _js_fn("seekToEvent")
     css = PAGE_HTML.split("body.rot90 #stage")[1].split("}")[0]
     assert "rotate(90deg)" in css and "100dvh" in css and "100dvw" in css
+
+
+# ---------------------------------------------------------------- 首屏：缓存
+def test_discover_is_cached_for_a_while(upstream_url):
+    """榜单一天变不了几次，而每次首屏都要为它打两趟 TMDB——是首屏最慢的一段。"""
+    app = _movie_webapp(upstream_url)
+    calls = {"n": 0}
+    real = app._tmdb.chinese_movie
+
+    def counting(kind="now"):
+        calls["n"] += 1
+        return real(kind)
+
+    app._tmdb.chinese_movie = counting
+    a = app.api_discover("now")
+    b = app.api_discover("now")
+    assert calls["n"] == 1                     # 第二次没再打 TMDB
+    assert a["cached"] is False and b["cached"] is True
+    assert [i["title"] for i in a["items"]] == [i["title"] for i in b["items"]]
+    # 过了 TTL 就得重新拉
+    app._discover_cache["now"] = (0.0, app._discover_cache["now"][1])
+    app.api_discover("now")
+    assert calls["n"] == 2
+    app.stop()
+
+
+def test_page_revalidates_with_etag_but_apis_never_cache(upstream_url):
+    """页面 100KB 的内联 JS 每次部署都变：no-cache + ETag 两头都占——
+    每次都校验（新版本立刻生效），没变就 304。接口仍然 no-store。"""
+    from mediafans.web import PAGE_ETAG
+
+    app = make_webapp(upstream_url)
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        r = httpx.get(base + "/", timeout=10)
+        assert r.status_code == 200
+        assert r.headers["etag"] == PAGE_ETAG
+        assert r.headers["cache-control"] == "no-cache"
+        r2 = httpx.get(base + "/", headers={"If-None-Match": PAGE_ETAG}, timeout=10)
+        assert r2.status_code == 304 and not r2.content
+        # 接口一条都不该被缓存：网盘现状和进度都是实时的
+        r3 = httpx.get(base + "/api/list", params={"path": "/MediaFans"}, timeout=10)
+        assert "no-store" in r3.headers["cache-control"]
+    finally:
+        app.stop()
+
+
+def test_page_guards_against_double_clicks_and_paints_cache_first():
+    from mediafans.web import PAGE_HTML
+
+    # 连点同一个文件不再发第二个 /api/play；换了文件按序号只认最后一次
+    pf = _js_fn("playFile")
+    assert "playInFlightPath === f.path) return;" in pf
+    assert "if (seq !== playSeq) return;" in pf
+    # 上一集/下一集在直链没取回来时不接
+    assert "if (inflight > 0) return;" in _js_fn("playAdjacent")
+    # 快速切剧/切季：慢的响应后回来不能盖掉快的
+    assert "if (seq !== seasonSeq) return;" in _js_fn("loadSeason")
+    # 忙的时候把入口锁住，顶部有进度条
+    assert 'id="loadbar"' in PAGE_HTML and "body.busy .card" in PAGE_HTML
+    # 首屏先画上次的内容再刷新
+    ls = _js_fn("loadShows")
+    assert "cacheGet('discover_' + kind)" in ls and "cachePut('discover_' + kind" in ls
+    assert "cacheGet('recent')" in _js_fn("renderWatch")
