@@ -758,11 +758,27 @@ class WebApp:
         return {"ok": True, "user": self.accounts.get(name).as_public()}
 
     def api_user_delete(self, payload: dict) -> dict:
+        """删用户，连他的观看进度一起删。
+
+        进度在 `watch-<用户名>.json` 里，不删的话账号没了文件还躺着——
+        下次建同名用户会莫名其妙地「继承」上一个人看到哪儿了。
+        **只删这个用户自己那一份**：管理员用的是共享的 watch.json，绝不能碰。
+        """
         self._require_admin()
+        name = str(payload.get("username") or "")
         try:
-            ok = self.accounts.remove(str(payload.get("username") or ""))
+            ok = self.accounts.remove(name)
         except ValueError as e:
             raise MediaFansError(str(e))
+        if ok:
+            store = self._watch_stores.pop(name, None)
+            safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in name)
+            path = self.watch_path.with_name(f"watch-{safe}.json")
+            if path != self.watch_path and path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass          # 删不掉只是留个孤儿文件，不该让删用户这件事失败
         return {"ok": ok}
 
     def _mark_of(self, path: str, nd: str = "quark") -> Optional[dict]:
@@ -1733,6 +1749,38 @@ PAGE_HTML = r"""<!doctype html>
   body.anon > header, body.anon main { visibility:hidden; }
   /* 用户菜单 */
   #whoami { font-size:12px; color:var(--dim); }
+  #usersBtn { display:none; }
+  body.is-admin #usersBtn { display:inline-block; }
+
+  /* 用户管理弹层 */
+  .modal { position:fixed; inset:0; background:rgba(0,0,0,.72); z-index:120;
+           display:none; align-items:center; justify-content:center; padding:16px; }
+  .modal.on { display:flex; }
+  .modal .panel { background:var(--panel); border:1px solid var(--line);
+                  border-radius:10px; width:560px; max-width:100%; max-height:86vh;
+                  display:flex; flex-direction:column; }
+  .modal .head { display:flex; align-items:center; gap:10px; padding:12px 14px;
+                 border-bottom:1px solid var(--line); }
+  .modal .head b { flex:1; }
+  .modal .foot { display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+                 padding:12px 14px; border-top:1px solid var(--line); }
+  .modal .foot input[type=text], .modal .foot input:not([type]),
+  .modal .foot input[type=password] {
+      background:var(--bg); border:1px solid var(--line); color:var(--text);
+      border-radius:6px; padding:8px 10px; font-size:13px; flex:1; min-width:120px; }
+  .modal .foot button { background:var(--accent); color:#fff; border:none;
+                        border-radius:6px; padding:8px 16px; font-size:13px; }
+  .modal .err { color:#ff7a7a; font-size:12px; padding:0 14px 10px; min-height:14px; }
+  #userList { overflow-y:auto; padding:6px 0; }
+  .urow { display:flex; align-items:center; gap:10px; padding:10px 14px;
+          border-bottom:1px solid var(--line); font-size:13px; }
+  .urow .n { flex:1; color:var(--text); }
+  .urow .tag { font-size:11px; color:var(--dim); border:1px solid var(--line);
+               border-radius:10px; padding:1px 8px; }
+  .urow .tag.on { color:var(--accent); border-color:var(--accent); }
+  .urow button { background:#222836; border:1px solid var(--line); color:var(--dim);
+                 border-radius:6px; padding:4px 10px; font-size:12px; }
+  .urow button:hover { color:var(--text); }
   /* 防呆：有请求在飞时，会触发新请求的入口一律不可点。
      手机上「点了没反应就再点一下」是本能，两次点击会开两个 /api/play，
      后一个还可能把前一个的结果盖掉。顶部的细条告诉用户「在忙，别点了」。 */
@@ -1894,6 +1942,9 @@ PAGE_HTML = r"""<!doctype html>
   .row.junk .name { color:var(--dim); }
   .kind { flex:none; font-size:10px; padding:0 5px; border-radius:3px;
           background:#2b3140; color:var(--dim); }
+  #usersBtn { background:#222836; border:1px solid var(--line); color:var(--dim);
+              border-radius:6px; padding:6px 10px; font-size:12px; }
+  #usersBtn:hover { color:var(--text); }
   #loginBtn, #outBtn { background:#222836; border:1px solid var(--line); color:var(--dim);
                        flex:none; border-radius:6px; padding:6px 10px; font-size:12px; }
   #loginBtn:hover, #outBtn:hover { color:var(--text); }
@@ -2041,6 +2092,21 @@ PAGE_HTML = r"""<!doctype html>
 </style>
 </head>
 <body class="anon">
+<div id="users" class="modal"><div class="panel">
+  <div class="head">
+    <b>用户管理</b>
+    <button class="linkbtn" onclick="closeUsers()">关闭</button>
+  </div>
+  <div id="userList"></div>
+  <div class="foot">
+    <input id="uName" placeholder="用户名" spellcheck="false" autocomplete="off">
+    <input id="uPass" type="password" placeholder="密码（至少 6 位）" autocomplete="new-password">
+    <label class="chk"><input type="checkbox" id="uAdmin"> 管理员</label>
+    <label class="chk"><input type="checkbox" id="uBrowse"> 可浏览网盘</label>
+    <button onclick="saveUser()">添加</button>
+  </div>
+  <div class="err" id="uErr"></div>
+</div></div>
 <div id="gate"><div class="box">
   <h2>MediaFans</h2>
   <div class="dim">请登录</div>
@@ -2058,6 +2124,7 @@ PAGE_HTML = r"""<!doctype html>
     <button onclick="searchMedia()">搜索</button>
   </div>
   <span id="whoami"></span>
+  <button id="usersBtn" onclick="openUsers()">用户</button>
   <button id="loginBtn" onclick="openLogin()">网盘登录</button>
   <button id="outBtn" onclick="doLogout()" title="退出账号">退出</button>
   <select id="driveSel" title="当前网盘：我的网盘 / 剧集 / 一键找片都作用于此盘" onchange="setDrive(this.value)">
@@ -2590,6 +2657,84 @@ function nextBestCopy() {
   return others.find(c => !risky(c)) || others[0] || null;
 }
 
+// ---------------- 用户管理（仅管理员）----------------
+// 服务端每个动作都自己再验一次管理员身份：这里藏按钮只是为了别碍眼，
+// 不是权限边界——前端的任何判断都不能当安全措施。
+function openUsers() { $('#users').classList.add('on'); renderUsers(); }
+function closeUsers() { $('#users').classList.remove('on'); $('#uErr').textContent = ''; }
+
+async function renderUsers() {
+  const box = $('#userList');
+  box.innerHTML = '<div class="empty">读取中…</div>';
+  try {
+    const d = await (await fetch('/api/users')).json();
+    if (d.error) throw new Error(d.error);
+    box.innerHTML = '';
+    for (const u of d.users) box.appendChild(userRow(u));
+  } catch (e) {
+    box.innerHTML = '<div class="empty">读取失败：' + e.message + '</div>';
+  }
+}
+
+function userRow(u) {
+  const row = el('div', 'urow');
+  row.appendChild(el('span', 'n', u.name + (me && u.name === me.name ? '（我）' : '')));
+  if (u.admin) row.appendChild(el('span', 'tag on', '管理员'));
+  row.appendChild(el('span', 'tag' + (u.can_browse ? ' on' : ''),
+                     u.can_browse ? '可浏览网盘' : '仅片库'));
+  row.appendChild(el('span', 'tag', '片库 ' + u.library));
+
+  // 管理员的浏览权限是恒定的，别给一个点了没反应的按钮
+  if (!u.admin) {
+    const b = el('button', null, u.can_browse ? '收回网盘' : '开放网盘');
+    b.onclick = () => saveUser({ username: u.name, can_browse: !u.can_browse });
+    row.appendChild(b);
+  }
+  const pw = el('button', null, '改密码');
+  pw.onclick = () => {
+    const v = prompt('给 ' + u.name + ' 设置新密码（至少 6 位）');
+    if (v) saveUser({ username: u.name, password: v });
+  };
+  row.appendChild(pw);
+
+  const del = el('button', null, '删除');
+  del.onclick = () => {
+    if (!confirm('删除 ' + u.name + '？他的片库和观看进度会一起消失。')) return;
+    fetch('/api/user/delete', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u.name }) })
+      .then(r => r.json())
+      .then(d => { if (d.error) $('#uErr').textContent = d.error; renderUsers(); });
+  };
+  row.appendChild(del);
+  return row;
+}
+
+async function saveUser(payload) {
+  const err = $('#uErr');
+  err.textContent = '';
+  const body = payload || {
+    username: $('#uName').value.trim(),
+    password: $('#uPass').value,
+    admin: $('#uAdmin').checked,
+    can_browse: $('#uBrowse').checked,
+  };
+  if (!body.username) { err.textContent = '要填用户名'; return; }
+  try {
+    const d = await (await fetch('/api/user/save', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) })).json();
+    if (d.error) throw new Error(d.error);
+    if (!payload) {
+      $('#uName').value = ''; $('#uPass').value = '';
+      $('#uAdmin').checked = false; $('#uBrowse').checked = false;
+    }
+    renderUsers();
+  } catch (e) {
+    err.textContent = e.message;
+  }
+}
+
 // ---------------- 我的片库 ----------------
 // 片库是**展示层**：只记「在追哪部作品」，不记文件在哪——文件属于资源层，
 // 会被转存、替换、删除。所以这里点进去是回作品页，由它去问当前有哪些文件。
@@ -2729,6 +2874,7 @@ async function doLogout() {
 function enter() {
   document.body.classList.remove('anon');
   $('#whoami').textContent = me ? (me.name + (me.admin ? '（管理员）' : '')) : '';
+  document.body.classList.toggle('is-admin', !!(me && me.admin));
   // 没有浏览网盘权限的用户，「我的网盘」这一页对他没意义
   if (me && !me.can_browse) {
     const t = $('#tabbtn-mine');

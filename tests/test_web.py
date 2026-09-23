@@ -1729,3 +1729,51 @@ def test_scanner_gets_404_everywhere_not_401(upstream_url, tmp_path):
                           timeout=10).status_code == 404
     finally:
         app.stop()
+
+
+def test_deleting_a_user_also_drops_their_progress(upstream_url, tmp_path):
+    """账号没了进度文件还躺着的话，下次建同名用户会莫名其妙继承上一个人的进度。
+
+    只删这一个用户自己那份——管理员用的是共享的 watch.json，绝不能碰。
+    """
+    app = _auth_app(upstream_url, tmp_path)
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        def tok(name):
+            return httpx.post(base + "/api/login",
+                              json={"username": name, "password": "hunter22"},
+                              timeout=10).json()["token"]
+
+        kid, root = tok("kid"), tok("root")
+        httpx.post(base + "/api/watch", cookies={"mf_token": kid},
+                   json={"path": "/d/E01.mkv", "position": 600, "duration": 3000},
+                   timeout=10)
+        httpx.post(base + "/api/watch", cookies={"mf_token": root},
+                   json={"path": "/d/E02.mkv", "position": 600, "duration": 3000},
+                   timeout=10)
+        kid_file = tmp_path / "watch-kid.json"
+        assert kid_file.exists() and app.watch_path.exists()
+
+        r = httpx.post(base + "/api/user/delete", cookies={"mf_token": root},
+                       json={"username": "kid"}, timeout=10)
+        assert r.json()["ok"] is True
+        assert not kid_file.exists()
+        assert app.watch_path.exists()          # 管理员那份一定还在
+        # 重建同名用户，进度是干净的
+        app.accounts.add("kid", "hunter22")
+        got = httpx.get(base + "/api/watch/recent", cookies={"mf_token": tok("kid")},
+                        timeout=10).json()
+        assert got["items"] == []
+    finally:
+        app.stop()
+
+
+def test_page_has_an_admin_only_user_panel():
+    """前端藏按钮只是别碍眼，不是权限边界——服务端每个动作都自己再验一次."""
+    from mediafans.web import PAGE_HTML
+
+    assert 'id="usersBtn"' in PAGE_HTML and 'id="users"' in PAGE_HTML
+    assert "body.is-admin #usersBtn { display:inline-block; }" in PAGE_HTML
+    assert "#usersBtn { display:none; }" in PAGE_HTML
+    for fn in ("openUsers", "renderUsers", "saveUser"):
+        assert "function " + fn in PAGE_HTML or "async function " + fn in PAGE_HTML
