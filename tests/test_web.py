@@ -1777,3 +1777,20 @@ def test_page_has_an_admin_only_user_panel():
     assert "#usersBtn { display:none; }" in PAGE_HTML
     for fn in ("openUsers", "renderUsers", "saveUser"):
         assert "function " + fn in PAGE_HTML or "async function " + fn in PAGE_HTML
+
+
+def test_frontend_cache_is_namespaced_per_user():
+    """服务端隔离了不等于用户看到的是隔离的。
+
+    首屏那层 localStorage 缓存一开始是全局的：同一台设备换个账号登录，
+    会先把上一个人的「最近观看」画出来——看起来就像隔离失效了。
+    """
+    from mediafans.web import PAGE_HTML
+
+    ns = _js_fn("cacheNs")
+    assert "me && me.name" in ns                      # 键里带用户名
+    for fn in ("cacheGet", "cachePut"):
+        assert "cacheNs() + key" in _js_fn(fn)
+    # 退出时把这台设备上所有人的缓存都清掉
+    assert "cacheClearAll()" in _js_fn("doLogout")
+    assert "k.startsWith('mf_c_')" in PAGE_HTML

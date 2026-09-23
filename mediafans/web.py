@@ -171,6 +171,8 @@ class WebApp:
         self._tv_failed = ""     # TV 这条路挂了的原因
         self._tv_failed_at = 0.0  # 什么时候挂的——过了冷却期要再给它一次机会
         self.registry = _PlayRegistry()
+        # 字幕令牌另开一份：字幕是 <track src> 取的，跟播放直链各管各的生命周期
+        self.subs_registry = _PlayRegistry(cap=60)
         self.logins = _LoginSessions()
         self.jobs = _AutoJobs()
         self._tmdb = None
@@ -438,6 +440,64 @@ class WebApp:
             "direct": direct,
             "fallback_reason": "" if direct else (self._tv_failed or ""),
         }
+
+    # ------------------------------------------------------------------ 字幕
+    def api_subs(self, raw_path: str, nd: str = "quark") -> dict:
+        """这个视频旁边有哪些外挂字幕。
+
+        只做外挂。`<video>` 只认 WebVTT 的 `<track>`，不渲染 MKV 内封字幕；
+        内封的要在服务端抽，而字幕轨在 MKV 里是交错存储的——抽一条等于把整个
+        文件读一遍，几十 GB 的 remux 根本不可行。所以内封的老实告诉用户
+        「浏览器放不了」，别假装能放。
+        """
+        from .subs import describe, is_subtitle, match_for
+
+        drive = self._drive_for(nd)
+        path = norm_path(unquote(raw_path))
+        folder, _, name = path.rpartition("/")
+        fid = drive.resolve_path(folder or "/")
+        if not fid:
+            return {"items": []}
+        try:
+            entries = [f for f in drive.list_files(fid) if not f.is_dir]
+        except Exception:
+            return {"items": []}
+        picked = match_for(name, [f.name for f in entries])
+        by_name = {f.name: f for f in entries}
+        items = []
+        for n in picked:
+            f = by_name.get(n)
+            if not f or not is_subtitle(n):
+                continue
+            label, lang = describe(n)
+            token = self.subs_registry.add((nd, f.fid, n))
+            items.append({"name": n, "label": label, "lang": lang,
+                          "url": f"/subs?t={token}"})
+        return {"items": items}
+
+    def subtitle_vtt(self, token: str) -> Optional[bytes]:
+        """把字幕文件取下来转成 VTT。字幕都很小，直接整个读进内存。"""
+        from .subs import to_vtt
+
+        hit = self.subs_registry.get(token)
+        if not hit:
+            return None
+        nd, fid, name = hit
+        drive = self._drive_for(nd)
+        target = drive.get_play_target(fid, name=name)
+        url = target.download_url or target.url
+        if not url:
+            return None
+        import httpx
+
+        with httpx.Client(timeout=30, follow_redirects=True) as c:
+            r = c.get(url, headers=dict(target.headers()))
+            r.raise_for_status()
+            data = r.content
+        # 200MB 的「字幕」不是字幕，多半是点错了；别把内存吃掉
+        if len(data) > 8 * 1024 * 1024:
+            return None
+        return to_vtt(name, data).encode("utf-8")
 
     # ------------------------------------------------------------------ 扫码登录
     def api_login_start(self, kind: str) -> dict:
@@ -1393,7 +1453,8 @@ class WebApp:
                 只有 `/api/` 和 `/stream` 是真实的，其余一律当不存在——
                 扫描器试的 `/login` `/admin` `/.env` `/wp-login.php` 都落在外面。
                 """
-                return path.startswith("/api/") or path == "/stream"
+                return (path.startswith("/api/") or path == "/stream"
+                        or path == "/subs")
 
             def _not_found(self) -> None:
                 """扫描器看到的东西：和「这个站点不存在」一模一样。
@@ -1501,6 +1562,15 @@ class WebApp:
                         self._json(200, app.api_library())
                     elif parsed.path == "/api/users":
                         self._json(200, app.api_users())
+                    elif parsed.path == "/api/subs":
+                        self._json(200, app.api_subs(query.get("path", ""),
+                                                     query.get("nd", "quark")))
+                    elif parsed.path == "/subs":
+                        body = app.subtitle_vtt(query.get("t", ""))
+                        if body is None:
+                            self._json(404, {"error": "字幕不存在或已过期"})
+                        else:
+                            self._send(200, body, "text/vtt; charset=utf-8")
                     elif parsed.path == "/api/list":
                         self._json(200, app.api_list(query.get("path", ""),
                                                      query.get("nd", "quark")))
@@ -1687,6 +1757,12 @@ PAGE_HTML = r"""<!doctype html>
                  font-size:15px; line-height:1; }
   #ctrl select { background:rgba(0,0,0,.45); border:1px solid rgba(255,255,255,.25);
                  color:#fff; }
+  /* 字幕按钮：没有字幕就不显示，有就显示，开着的时候点亮 */
+  #subBtn { display:none; font-size:13px; }
+  #subBtn.has { display:inline-block; }
+  #subBtn.on { color:var(--accent); }
+  /* 字幕在全屏时别贴着屏幕底边 */
+  video::cue { font-size:inherit; background:rgba(0,0,0,.55); }
   #ctrl button:hover { color:var(--accent); }
   #ctrl .time { font-variant-numeric:tabular-nums; white-space:nowrap; }
   #trackWrap { flex:1; height:16px; display:flex; align-items:center; cursor:pointer;
@@ -2300,6 +2376,7 @@ PAGE_HTML = r"""<!doctype html>
           <option value="1.75">1.75×</option>
           <option value="2">2.0×</option>
         </select>
+        <button id="subBtn" onclick="cycleSub()" title="字幕">字</button>
         <button id="rotBtn" onclick="toggleOrientation()" title="网页横屏 / 回来">⟳</button>
         <button id="fsBtn" onclick="toggleFullscreen()" title="全屏（f）">⛶</button>
       </div>
@@ -2595,6 +2672,67 @@ function renderCrumb(path) {
   }
 }
 
+// ---------------- 字幕 ----------------
+// 只有外挂字幕。<video> 只认 WebVTT 的 <track>，MKV 内封字幕浏览器不渲染——
+// 服务端抽又要把整个文件读一遍（字幕轨是交错存储的），几十 GB 的 remux 不可行。
+// 所以这里能亮就亮，亮不了就明说，别让用户以为是自己没找到开关。
+let subTracks = [];      // 服务端给的外挂字幕列表
+let subIndex = -1;       // -1 = 关闭
+
+async function loadSubs(path, nd) {
+  subTracks = [];
+  subIndex = -1;
+  // 换片先把上一片的 track 清掉，否则字幕会串台
+  for (const t of [...video.querySelectorAll('track')]) t.remove();
+  paintSubButton();
+  try {
+    const d = await (await fetch('/api/subs?path=' + encodeURIComponent(path)
+                                 + '&nd=' + nd)).json();
+    subTracks = d.items || [];
+  } catch (e) { subTracks = []; }
+  if (!subTracks.length) { paintSubButton(); return; }
+  subTracks.forEach((s, i) => {
+    const t = document.createElement('track');
+    t.kind = 'subtitles';
+    t.label = s.label || ('字幕' + (i + 1));
+    if (s.lang) t.srclang = s.lang;
+    t.src = s.url;
+    video.appendChild(t);
+  });
+  // 默认开第一条：会去找字幕的人就是想看字幕
+  setTimeout(() => selectSub(0), 200);
+  paintSubButton();
+}
+
+function selectSub(i) {
+  const tt = video.textTracks;
+  for (let k = 0; k < tt.length; k++) tt[k].mode = (k === i) ? 'showing' : 'disabled';
+  subIndex = i;
+  paintSubButton();
+}
+
+/** 点一下轮换：关 -> 第1条 -> 第2条 -> … -> 关 */
+function cycleSub() {
+  if (!subTracks.length) return;
+  const next = subIndex + 1 >= subTracks.length ? -1 : subIndex + 1;
+  selectSub(next);
+  const hint = $('#hint');
+  hint.className = '';
+  hint.textContent = next < 0 ? '字幕已关闭'
+    : ('字幕：' + (subTracks[next].label || ('轨道' + (next + 1))));
+}
+
+function paintSubButton() {
+  const b = $('#subBtn');
+  if (!b) return;
+  b.classList.toggle('has', subTracks.length > 0);
+  b.classList.toggle('on', subIndex >= 0);
+  b.title = subTracks.length
+    ? (subIndex >= 0 ? ('字幕：' + subTracks[subIndex].label + '（点击切换）')
+                     : '字幕已关闭（点击开启）')
+    : '这个文件没有外挂字幕';
+}
+
 // ---------------- 来源切换 ----------------
 // 同一集在网盘里可能存了好几份（4K 原盘 / 1080p WEB-DL / 国语版…）。
 // 「哪一份能播」只有播起来才知道：原盘 MKV 浏览器多半解不了、直链可能被 CDN 拒。
@@ -2867,6 +3005,7 @@ async function doLogin() {
 async function doLogout() {
   try { await fetch('/api/logout', { method: 'POST' }); } catch (e) {}
   document.cookie = 'mf_token=; Path=/; Max-Age=0';
+  cacheClearAll();
   location.reload();
 }
 
@@ -2895,11 +3034,28 @@ function busy(on) {
 // 本地缓存：首屏先把上次的内容画出来，再去后台刷新（stale-while-revalidate）。
 // 榜单和最近观看都是「先看到再说」的东西，等 TMDB 那两趟请求回来再画，
 // 手机上首屏会空白一两秒。缓存只当占位，刷新回来一定覆盖。
+//
+// **键必须带用户名**。服务端本来就是隔离的，但这层缓存一开始不是：
+// 同一台设备上换个账号登录，会先把上一个人的「最近观看」画出来——
+// 看起来就像隔离失效了。榜单是公共数据本可以共享，但统一按用户分更省事：
+// 少一条「这个 key 是不是用户相关」的例外，以后加新 key 也不会忘。
+function cacheNs() { return 'mf_c_' + (me && me.name ? me.name : '_') + '_'; }
+
 function cacheGet(key) {
-  try { return JSON.parse(localStorage.getItem('mf_c_' + key) || 'null'); } catch (e) { return null; }
+  try { return JSON.parse(localStorage.getItem(cacheNs() + key) || 'null'); }
+  catch (e) { return null; }
 }
 function cachePut(key, value) {
-  try { localStorage.setItem('mf_c_' + key, JSON.stringify(value)); } catch (e) {}
+  try { localStorage.setItem(cacheNs() + key, JSON.stringify(value)); } catch (e) {}
+}
+
+/** 退出时把这台设备上所有人的缓存都清掉——共用设备上别给下一个人留痕迹。 */
+function cacheClearAll() {
+  try {
+    for (const k of Object.keys(localStorage)) {
+      if (k.startsWith('mf_c_')) localStorage.removeItem(k);
+    }
+  } catch (e) {}
 }
 
 // 同一个路径已经在取直链了就别再发一次；换了路径则新的为准、旧的结果丢弃
@@ -2929,6 +3085,7 @@ async function playFile(f) {
     const pick = chooseStream(data);
     renderQuality(data, pick);
     renderSources(f.path);
+    loadSubs(f.path, curPlayNd);          // 不等它，字幕晚一点出来不挡播放
     const at = f.startAt !== undefined ? f.startAt : await resumePos(f.path);
     playStream(data, pick, at);
     renderNav(f);
