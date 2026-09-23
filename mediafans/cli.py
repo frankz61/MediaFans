@@ -757,7 +757,8 @@ def web(
             providers = build_providers(cfg.get("search") or {})
             return aggregate_search(providers, kw, netdisk=netdisk)
 
-        from .config import baidu_token_file_for, tv_token_file_for, watch_file_for
+        from .config import (accounts_file_for, baidu_token_file_for,
+                     tv_token_file_for, watch_file_for)
 
         app_ = WebApp(lambda nd="quark": _drive(cfg, nd), search_fn=_do_search, host=host, port=port,
                       cookie_path=cookie_file_for(cfg),
@@ -769,6 +770,8 @@ def web(
                       tmdb_base_url=str(cfg.get("tmdb.base_url") or ""),
                       picker=_picker(cfg),
                       watch_path=watch_file_for(cfg),
+                      accounts_path=accounts_file_for(cfg),
+                      entry=str(cfg.get("web.entry") or ""),
                       prefer_chinese=bool(cfg.get("tmdb.prefer_chinese", True)))
         local_url = app_.page_url(path, host="127.0.0.1")
         app_.start()
@@ -866,3 +869,65 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@app.command("user")
+def user_cmd(
+    action: str = typer.Argument(..., help="list | add | passwd | grant | revoke | del"),
+    name: str = typer.Argument("", help="用户名"),
+    password: str = typer.Option("", "--password", "-p", help="密码（add / passwd）"),
+    admin: bool = typer.Option(False, "--admin", help="建成管理员"),
+    browse: bool = typer.Option(False, "--browse", help="允许浏览整个网盘"),
+):
+    """管理账号。
+
+    片库和进度是按用户分的，网盘是共用的——所以「能不能浏览整个网盘」要单独给
+    （`grant <名字>`），否则用户绕开片库就能看到所有东西。
+    """
+    from .accounts import Accounts
+    from .config import accounts_file_for
+
+    cfg = _cfg()
+    acc = Accounts(accounts_file_for(cfg))
+    try:
+        if action == "list":
+            users = acc.list_users()
+            if not users:
+                console.print("[yellow]还没有账号。先建一个管理员："
+                              "mediafans user add <名字> -p <密码> --admin[/yellow]")
+                return
+            for u in users:
+                tags = []
+                if u.admin:
+                    tags.append("管理员")
+                if u.browsable():
+                    tags.append("可浏览网盘")
+                console.print(f"  {u.name:<16} {'、'.join(tags) or '普通用户':<14} "
+                              f"片库 {len(u.library)} 部")
+            return
+        if not name:
+            _fail(MediaFansError("要指定用户名"))
+        if action == "add":
+            if not password:
+                password = typer.prompt("密码", hide_input=True, confirmation_prompt=True)
+            acc.add(name, password, admin=admin, can_browse=browse)
+            console.print(f"[green]✓ 已创建 {name}"
+                          f"{'（管理员）' if admin else ''}[/green]")
+        elif action == "passwd":
+            if not password:
+                password = typer.prompt("新密码", hide_input=True, confirmation_prompt=True)
+            acc.set_password(name, password)
+            console.print(f"[green]✓ {name} 的密码已改（该用户的登录会话全部失效）[/green]")
+        elif action == "grant":
+            acc.set_flags(name, can_browse=True)
+            console.print(f"[green]✓ {name} 现在可以浏览整个网盘[/green]")
+        elif action == "revoke":
+            acc.set_flags(name, can_browse=False)
+            console.print(f"[green]✓ {name} 只能看自己的片库了[/green]")
+        elif action == "del":
+            console.print("[green]✓ 已删除[/green]" if acc.remove(name)
+                          else "[yellow]没有这个用户[/yellow]")
+        else:
+            _fail(MediaFansError(f"不认识的动作: {action}"))
+    except ValueError as e:
+        _fail(MediaFansError(str(e)))

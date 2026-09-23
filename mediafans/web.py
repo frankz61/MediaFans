@@ -142,6 +142,8 @@ class WebApp:
                  token: str = "", use_tv: bool = True,
                  tmdb_key: str = "", tmdb_base_url: str = "", picker=None,
                  watch_path: Optional[Path] = None,
+                 accounts_path: Optional[Path] = None,
+                 entry: str = "",
                  prefer_chinese: bool = True):
         # drive_factory(nd) -> BaseDrive，按网盘建驱动（nd: quark | baidu）
         self.drive_factory = drive_factory
@@ -179,8 +181,25 @@ class WebApp:
         # 进度只记在某一台上等于没记
         from .watch import WatchStore
 
-        self.watch = WatchStore(Path(watch_path) if watch_path
-                                else Path.home() / ".mediafans" / "watch.json")
+        self.watch_path = (Path(watch_path) if watch_path
+                           else Path.home() / ".mediafans" / "watch.json")
+        # 管理员沿用原来那份 watch.json（不迁移，升级即用）；
+        # 其他用户各自一份 watch-<用户名>.json
+        self.watch = WatchStore(self.watch_path)
+        self._watch_stores: dict = {}
+
+        from .accounts import Accounts
+
+        self.accounts = Accounts(Path(accounts_path) if accounts_path
+                                 else self.watch_path.parent / "users.json")
+        # 防扫描入口：登录页只在这个路径上出现，根路径一律 404。
+        # 公网上的登录页是会被扫的——不给它一个「这里有东西」的信号最省事。
+        self.entry = (entry or "").strip().strip("/")
+        # 当前请求是谁。用线程局部而不是给二十来个 api_* 方法逐个加参数：
+        # 服务器本来就是一请求一线程，而「当前用户」是贯穿整个请求的环境量，
+        # 一路显式传下去只会让每个签名都多一个几乎不用的参数。
+        # **后台任务是例外**——它跑在别的线程上，必须在闭包里捕获后显式传。
+        self._ctx = threading.local()
         self._drives: dict = {}
         self._discover_cache: dict = {}      # kind -> (ts, result)
         self._discover_lock = threading.Lock()
@@ -271,6 +290,46 @@ class WebApp:
         return self._tv
 
     # ------------------------------------------------------------------ api
+    def master_user(self):
+        """`--token` 和本机免验对应的身份：一个内建的管理员。
+
+        它不在 users.json 里——那个令牌是升级前就有的运维凭据，不是账号。
+        有它就能干管理员能干的一切，包括建用户。第一个管理员就是这么建出来的。
+        """
+        from .accounts import User
+
+        if getattr(self, "_master", None) is None:
+            self._master = User(name="_master", admin=True, can_browse=True)
+        return self._master
+
+    def set_user(self, user) -> None:
+        self._ctx.user = user
+
+    def current_user(self):
+        return getattr(self._ctx, "user", None)
+
+    def _watch(self):
+        """当前用户的进度库。"""
+        return self._watch_for(self.current_user())
+
+    def _watch_for(self, user) -> "WatchStore":
+        """这个用户的进度库。
+
+        管理员用原来那份 watch.json——升级前的进度不用迁移就还在。
+        其他人各自一份，互相看不见对方看到哪儿了（这正是「展示层分开」的一半，
+        另一半是片库）。
+        """
+        from .watch import WatchStore
+
+        name = getattr(user, "name", "") or ""
+        if not name or getattr(user, "admin", False):
+            return self.watch
+        if name not in self._watch_stores:
+            safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in name)
+            self._watch_stores[name] = WatchStore(
+                self.watch_path.with_name(f"watch-{safe}.json"))
+        return self._watch_stores[name]
+
     @staticmethod
     def _watch_key(path: str, nd: str) -> str:
         """进度键。夸克用裸路径（兼容旧 watch.json），其他网盘加前缀防撞."""
@@ -289,6 +348,11 @@ class WebApp:
         return dict(mark_dict, netdisk="quark", play_path=path)
 
     def api_list(self, raw_path: str, nd: str = "quark") -> dict:
+        # 浏览整个网盘是资源层的权限，默认只有管理员有：网盘目录里什么都有，
+        # 谁都能翻的话片库这一层就白分了
+        u = self.current_user()
+        if u is not None and not u.browsable():
+            raise MediaFansError("没有浏览网盘的权限（片库之外的内容需要管理员开通）")
         drive = self._drive_for(nd)
         nd = drive.name
         path = norm_path(unquote(raw_path)) if raw_path else norm_path(drive.save_dir)
@@ -584,15 +648,132 @@ class WebApp:
             "overview": i.overview, "poster": i.poster, "tmdb_id": i.tmdb_id,
         } for i in items if i.tmdb_id]}
 
+    # ---------------------------------------------------------------- 账号
+    def api_login(self, payload: dict, ip: str = "") -> dict:
+        name = str(payload.get("username") or "").strip()
+        pw = str(payload.get("password") or "")
+        token = self.accounts.login(name, pw, ip=ip)
+        if not token:
+            raise MediaFansError("用户名或密码不对")
+        u = self.accounts.get(name)
+        return {"token": token, "user": u.as_public()}
+
+    def api_logout(self, token: str) -> dict:
+        self.accounts.logout(token)
+        return {"ok": True}
+
+    def api_me(self) -> dict:
+        u = self.current_user()
+        if not u:
+            raise MediaFansError("未登录")
+        return {"user": u.as_public()}
+
+    # ---------------------------------------------------------------- 片库
+    def api_library(self) -> dict:
+        """当前用户的片库。
+
+        **这是展示层**：只记「在追哪部作品」，不记文件在哪。文件属于资源层，
+        会被转存、替换、删除；片库记的是意图。进度另算（每个用户一份）。
+        """
+        u = self.current_user()
+        if not u:
+            raise MediaFansError("未登录")
+        items = [i.as_dict() for i in self.accounts.library(u.name)]
+        # 顺带把进度贴上：片库页要显示「看到第几集」
+        store = self._watch_for(u)
+        recent = {m.tmdb_id: m for m in store.recent(50) if m.tmdb_id}
+        for it in items:
+            m = recent.get(it["tmdb_id"])
+            if m:
+                it["watched"] = {"percent": m.percent, "season": m.season,
+                                 "episode": m.episode, "finished": m.finished,
+                                 "ep_title": m.ep_title}
+        return {"items": items}
+
+    def api_library_add(self, payload: dict) -> dict:
+        from .accounts import LibraryItem
+
+        u = self.current_user()
+        if not u:
+            raise MediaFansError("未登录")
+        tmdb_id = int(payload.get("tmdb_id") or 0)
+        if not tmdb_id:
+            raise MediaFansError("缺少 tmdb_id")
+        media = "movie" if payload.get("media_type") == "movie" else "tv"
+        season = payload.get("season")
+        item = LibraryItem(
+            tmdb_id=tmdb_id, media_type=media,
+            title=str(payload.get("title") or ""),
+            year=str(payload.get("year") or ""),
+            poster=str(payload.get("poster") or ""),
+            season=int(season) if season not in (None, "", 0) and media == "tv" else None,
+        )
+        self.accounts.add_to_library(u.name, item)
+        return {"ok": True, "in_library": True}
+
+    def api_library_remove(self, payload: dict) -> dict:
+        u = self.current_user()
+        if not u:
+            raise MediaFansError("未登录")
+        media = "movie" if payload.get("media_type") == "movie" else "tv"
+        self.accounts.remove_from_library(u.name, int(payload.get("tmdb_id") or 0), media)
+        return {"ok": True, "in_library": False}
+
+    # ---------------------------------------------------------------- 用户管理
+    def _require_admin(self):
+        u = self.current_user()
+        if not u or not u.admin:
+            raise MediaFansError("需要管理员权限")
+        return u
+
+    def api_users(self) -> dict:
+        self._require_admin()
+        return {"users": [u.as_public() for u in self.accounts.list_users()]}
+
+    def api_user_save(self, payload: dict) -> dict:
+        """新建或改用户。改自己的密码不需要管理员——那是常识，别让人找管理员重置。"""
+        me = self.current_user()
+        if not me:
+            raise MediaFansError("未登录")
+        name = str(payload.get("username") or "").strip()
+        pw = str(payload.get("password") or "")
+        own = bool(name) and name == me.name
+        if not own:
+            self._require_admin()
+        try:
+            if self.accounts.get(name):
+                if pw:
+                    self.accounts.set_password(name, pw)
+                if me.admin and not own:
+                    self.accounts.set_flags(
+                        name,
+                        admin=payload.get("admin") if "admin" in payload else None,
+                        can_browse=payload.get("can_browse") if "can_browse" in payload else None)
+            else:
+                self._require_admin()
+                self.accounts.add(name, pw, admin=bool(payload.get("admin")),
+                                  can_browse=bool(payload.get("can_browse")))
+        except ValueError as e:
+            raise MediaFansError(str(e))
+        return {"ok": True, "user": self.accounts.get(name).as_public()}
+
+    def api_user_delete(self, payload: dict) -> dict:
+        self._require_admin()
+        try:
+            ok = self.accounts.remove(str(payload.get("username") or ""))
+        except ValueError as e:
+            raise MediaFansError(str(e))
+        return {"ok": ok}
+
     def _mark_of(self, path: str, nd: str = "quark") -> Optional[dict]:
-        m = self.watch.get(self._watch_key(path, nd)) if path else None
+        m = self._watch().get(self._watch_key(path, nd)) if path else None
         if not m:
             return None
         return {"percent": m.percent, "finished": m.finished,
                 "resume_at": m.resume_at, "position": m.position,
                 "duration": m.duration}
 
-    def _attach_watch(self, data: dict, nd: str = "quark") -> dict:
+    def _attach_watch(self, data: dict, nd: str = "quark", user=None) -> dict:
         """把「看到哪儿了」附到列表上。
 
         列出可播放文件的地方都带上，进度才在哪儿都看得见——
@@ -606,7 +787,8 @@ class WebApp:
             paths = [c.get("path", "") for c in (ep.get("copies") or [])]
             if not paths and ep.get("local"):
                 paths = [ep["local"].get("path", "")]
-            marks = [m for m in (self.watch.get(self._watch_key(p, nd))
+            store = self._watch_for(user) if user is not None else self._watch()
+            marks = [m for m in (store.get(self._watch_key(p, nd))
                                  for p in paths if p) if m]
             if marks:
                 m = max(marks, key=lambda x: x.updated)
@@ -628,12 +810,12 @@ class WebApp:
             except (TypeError, ValueError):
                 meta[k] = None
         key = self._watch_key(path, str(payload.get("netdisk") or "quark"))
-        m = self.watch.save(key, float(payload.get("position") or 0),
+        m = self._watch().save(key, float(payload.get("position") or 0),
                             float(payload.get("duration") or 0), **meta)
         return {"ok": True, "mark": m.as_dict()}
 
     def api_watch_get(self, path: str, nd: str = "quark") -> dict:
-        m = self.watch.get(self._watch_key(unquote(path or ""), nd))
+        m = self._watch().get(self._watch_key(unquote(path or ""), nd))
         return {"mark": m.as_dict() if m else None}
 
     def api_watch_recent(self, limit: int = 12) -> dict:
@@ -642,11 +824,11 @@ class WebApp:
         except (TypeError, ValueError):
             n = 12
         return {"items": [self._watch_parse(m.as_dict())
-                          for m in self.watch.recent(n)]}
+                          for m in self._watch().recent(n)]}
 
     def api_watch_forget(self, payload: dict) -> dict:
         # 前端传的 path 就是存储键（baidu 带前缀），按原样删
-        return {"ok": self.watch.forget(str(payload.get("path") or ""))}
+        return {"ok": self._watch().forget(str(payload.get("path") or ""))}
 
     def api_series(self, tmdb_id: int, season: int, refresh: bool = False,
                    nd: str = "quark", media: str = "tv") -> dict:
@@ -702,6 +884,8 @@ class WebApp:
             raise MediaFansError("未配置搜索源")
         nd = self._nd_of(payload.get("netdisk"))
 
+        who = self.current_user()          # 任务跑在别的线程上，线程局部拿不到
+
         def runner(on_step):
             if is_movie:
                 view = build_movie(lambda: self._drive_for(nd), self.search_fn,
@@ -711,7 +895,7 @@ class WebApp:
                                     self.tmdb, tmdb_id, season, on_step=on_step,
                                     netdisk=nd)
             self.series_cache.put((nd, tmdb_id, season), view)
-            return self._attach_watch(view.as_dict(), nd)
+            return self._attach_watch(view.as_dict(), nd, who)
 
         return {"job": self.jobs.start(runner)}
 
@@ -771,6 +955,7 @@ class WebApp:
         sources = list(row.sources)
         have = [c.name for c in row.copies]
         local_dir = view.local_dir
+        who = self.current_user()
 
         def runner(on_step):
             res = fetch_all(lambda: self._drive_for(nd), sources, local_dir,
@@ -784,7 +969,7 @@ class WebApp:
                                          size=f["size"], height=f["height"],
                                          source=f["source"]))
                 self.series_cache.put((nd, tmdb_id, season), live)
-            out = self._attach_watch(live.as_dict(), nd)
+            out = self._attach_watch(live.as_dict(), nd, who)
             out["fetched"] = res
             return out
 
@@ -806,6 +991,7 @@ class WebApp:
         want = [int(e) for e in (payload.get("episodes") or [])]
         rows = [r for r in view.rows if not want or r.episode in want]
         groups = plan_batch(rows)
+        who = self.current_user()
         if not groups:
             raise MediaFansError("没有可以补的集（都已存在，或还没找到来源）")
         # 登录态先问一句：40 集的活跑到一半才发现要重登，前面的等待全白费
@@ -829,7 +1015,7 @@ class WebApp:
                         size=f.size if f else 0, height=f.height if f else 0,
                         source=f.source if f else "")
             self.series_cache.put((nd, tmdb_id, season), live)
-            out = self._attach_watch(live.as_dict())
+            out = self._attach_watch(live.as_dict(), nd, who)
             out["batch"] = res.as_dict()
             return out
 
@@ -1020,36 +1206,93 @@ class WebApp:
             def log_message(self, *args):  # 静音访问日志
                 pass
 
-            def _authorized(self, query: dict) -> bool:
-                """没设令牌 = 只监听本机，放行；设了令牌则本机免验、外部认令牌。
-
-                注意「本机免验」只对真正的本机浏览器成立。放在 nginx 反代后面时，
-                请求也是从 127.0.0.1 过来的，照免不误就等于认证被绕过——
-                所以带了 X-Forwarded-For 的一律当外部请求处理。
-                """
-                if not app.token:
-                    return True
-                proxied = bool(self.headers.get("X-Forwarded-For"))
-                if not proxied and self.client_address[0] in ("127.0.0.1", "::1"):
-                    return True
-                if query.get("token") == app.token:
-                    return True
+            def _bearer(self, query: dict) -> str:
+                """令牌从哪来：query 优先（书签、电视端），其次 cookie。"""
+                t = query.get("token") or ""
+                if t:
+                    return t
                 for pair in (self.headers.get("Cookie") or "").split(";"):
                     name, _, value = pair.strip().partition("=")
-                    if name == "mf_token" and value == app.token:
-                        return True
+                    if name == "mf_token":
+                        return value
+                return ""
+
+            def _client_ip(self) -> str:
+                fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+                return fwd or self.client_address[0]
+
+            def _authorized(self, query: dict) -> bool:
+                """认令牌并把「当前是谁」挂到线程上。
+
+                三条路，按顺序：
+
+                1. **会话令牌** → 对应的用户。这是登录之后的正常路径。
+                2. **启动参数 `--token`** → 视为管理员。它是升级前就存在的那个共享令牌，
+                   老书签、电视端都还在用它；直接废掉会把所有设备踢下线。
+                3. **本机免验**（没设 `--token` 时）→ 管理员。只对真正的本机浏览器成立：
+                   放在 nginx 反代后面时请求也是从 127.0.0.1 过来的，照免不误就等于
+                   认证被绕过，所以带了 X-Forwarded-For 的一律当外部请求。
+                """
+                app.set_user(None)
+                tok = self._bearer(query)
+                u = app.accounts.resolve(tok) if tok else None
+                if u is not None:
+                    app.set_user(u)
+                    return True
+                if app.token and tok == app.token:
+                    app.set_user(app.master_user())
+                    return True
+                # 本机免验：设不设 --token 都成立（升级前就是这个语义，服务器上
+                # 直接开浏览器或跑 CLI 靠它）。真正的防线是下面这个 XFF 判断。
+                proxied = bool(self.headers.get("X-Forwarded-For"))
+                if not proxied and self.client_address[0] in ("127.0.0.1", "::1"):
+                    app.set_user(app.master_user())
+                    return True
                 return False
 
             def _deny(self) -> None:
-                self._json(403, {"error": "需要访问令牌：请用启动时打印的完整链接（带 token）打开"})
+                self._json(401, {"error": "需要登录", "login": True})
 
             def do_POST(self):  # noqa: N802
                 parsed = urlparse(self.path)
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-                if not self._authorized(query):
+                ok = self._authorized(query)
+                if not self._known(parsed.path):
+                    self._not_found()
+                    return
+                if parsed.path == "/api/login":
+                    ip = self._client_ip()
+                    # 连续失败就拖时间。不封禁——封禁会让 NAT 后面整栋楼连坐，
+                    # 而拖延对字典爆破一样致命，对打错密码的人几乎无感。
+                    delay = app.accounts.throttle_delay(ip)
+                    if delay:
+                        time.sleep(delay)
+                    try:
+                        self._json(200, app.api_login(self._body(), ip=ip))
+                    except MediaFansError as e:
+                        self._json(401, {"error": str(e)})
+                    except Exception as e:
+                        self._json(500, {"error": str(e)})
+                    return
+                if not ok:
                     self._deny()
                     return
                 try:
+                    if parsed.path == "/api/logout":
+                        self._json(200, app.api_logout(self._bearer(query)))
+                        return
+                    if parsed.path == "/api/library/add":
+                        self._json(200, app.api_library_add(self._body()))
+                        return
+                    if parsed.path == "/api/library/remove":
+                        self._json(200, app.api_library_remove(self._body()))
+                        return
+                    if parsed.path == "/api/user/save":
+                        self._json(200, app.api_user_save(self._body()))
+                        return
+                    if parsed.path == "/api/user/delete":
+                        self._json(200, app.api_user_delete(self._body()))
+                        return
                     if parsed.path == "/api/series/scan":
                         self._json(200, app.api_series_scan(self._body()))
                     elif parsed.path == "/api/watch":
@@ -1117,6 +1360,34 @@ class WebApp:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _is_entry(self, path: str) -> bool:
+                """这个路径算不算「入口」——能拿到页面的地方。
+
+                设了 entry 就只有 `/<entry>` 算，根路径一律 404：公网上的登录页
+                早晚会被扫，不给它「这里有东西」的信号最省事。没设就退回根路径，
+                本机自用别为这个多绕一层。
+                """
+                if not app.entry:
+                    return path == "/"
+                return path.strip("/") == app.entry
+
+            def _known(self, path: str) -> bool:
+                """这个路径是不是我们真有的东西。
+
+                只有 `/api/` 和 `/stream` 是真实的，其余一律当不存在——
+                扫描器试的 `/login` `/admin` `/.env` `/wp-login.php` 都落在外面。
+                """
+                return path.startswith("/api/") or path == "/stream"
+
+            def _not_found(self) -> None:
+                """扫描器看到的东西：和「这个站点不存在」一模一样。
+
+                刻意不用 403/401——那等于告诉对方「猜对路径了，只差认证」。
+                """
+                body = b"<html><head><title>404 Not Found</title></head>" \
+                       b"<body><center><h1>404 Not Found</h1></center></body></html>"
+                self._send(404, body, "text/html; charset=utf-8")
+
             def _send_page(self, extra_headers=None) -> None:
                 """发页面：带 ETag，浏览器每次问一下、没变就 304。
 
@@ -1177,18 +1448,43 @@ class WebApp:
             def do_GET(self):  # noqa: N802
                 parsed = urlparse(self.path)
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-                if not self._authorized(query):
+                page = parsed.path in ("/", "/index.html") or self._is_entry(parsed.path)
+                ok = self._authorized(query)
+                # 页面本身**不要求登录**——它自己会画登录框。但只在入口路径上给，
+                # 其余一律 404。要求登录再给页面反而更容易被扫：401 也是一种回应。
+                if not ok and not page:
+                    # 只有真实存在的路径才配拿到 401。`/login`、`/.env`、
+                    # `/wp-login.php` 这类乱试的一律 404——根路径都 404 了，
+                    # 别的路径回 401 等于告诉扫描器「这儿有东西，只差认证」。
+                    if not self._known(parsed.path):
+                        self._not_found()
+                        return
                     self._deny()
                     return
+                if page and not self._is_entry(parsed.path):
+                    # 设了 entry 之后，根路径对谁都是 404——包括已登录的人；
+                    # 书签存的就该是入口地址
+                    self._not_found()
+                    return
                 try:
-                    if parsed.path in ("/", "/index.html"):
-                        # 首页带对令牌就种个 cookie，之后 <video src> 之类的子请求
+                    if page:
+                        # 带对令牌就种个 cookie，之后 <video src> 之类的子请求
                         # 就不用每个都在 URL 里挂令牌了
                         extra = None
-                        if app.token and query.get("token") == app.token:
+                        tok = query.get("token") or ""
+                        # 只有**验过**的令牌才落 cookie。不能只看 ok：本机免验时
+                        # ok 也是 True，那样会把用户随手带的错令牌原样种进去。
+                        if tok and (app.accounts.resolve(tok) or
+                                    (app.token and tok == app.token)):
                             extra = [("Set-Cookie",
-                                      f"mf_token={app.token}; Path=/; SameSite=Lax; Max-Age=604800")]
+                                      f"mf_token={tok}; Path=/; SameSite=Lax; Max-Age=2592000")]
                         self._send_page(extra)
+                    elif parsed.path == "/api/me":
+                        self._json(200, app.api_me())
+                    elif parsed.path == "/api/library":
+                        self._json(200, app.api_library())
+                    elif parsed.path == "/api/users":
+                        self._json(200, app.api_users())
                     elif parsed.path == "/api/list":
                         self._json(200, app.api_list(query.get("path", ""),
                                                      query.get("nd", "quark")))
@@ -1419,6 +1715,24 @@ PAGE_HTML = r"""<!doctype html>
   #meta .sub { color:var(--dim); font-size:12px; }
   #hint { color:var(--dim); font-size:12px; padding:6px 4px; }
   #pbar { display:none; }
+  /* 登录遮罩。页面本身不要求登录就能拿到（见 _is_entry 的注释），
+     没登录时就盖上这一层，后面什么都不加载。 */
+  #gate { position:fixed; inset:0; z-index:200; background:var(--bg);
+          display:none; align-items:center; justify-content:center; padding:24px; }
+  body.anon #gate { display:flex; }
+  #gate .box { width:320px; max-width:100%; }
+  #gate h2 { font-size:20px; margin:0 0 4px; }
+  #gate .dim { font-size:12px; margin-bottom:16px; }
+  #gate input { width:100%; box-sizing:border-box; background:var(--panel);
+                border:1px solid var(--line); color:var(--text); border-radius:8px;
+                padding:12px; font-size:15px; margin-bottom:10px; }
+  #gate button { width:100%; background:var(--accent); color:#fff; border:none;
+                 border-radius:8px; padding:12px; font-size:15px; }
+  #gate .err { color:#ff7a7a; font-size:12px; min-height:16px; margin-top:8px; }
+  /* 没登录时别让底下的界面漏出来（遮罩是半透明背景色，内容还是别渲染） */
+  body.anon > header, body.anon main { visibility:hidden; }
+  /* 用户菜单 */
+  #whoami { font-size:12px; color:var(--dim); }
   /* 防呆：有请求在飞时，会触发新请求的入口一律不可点。
      手机上「点了没反应就再点一下」是本能，两次点击会开两个 /api/play，
      后一个还可能把前一个的结果盖掉。顶部的细条告诉用户「在忙，别点了」。 */
@@ -1440,6 +1754,7 @@ PAGE_HTML = r"""<!doctype html>
   #seasonTabs button.on { background:var(--accent); color:#fff; border-color:var(--accent); }
   #seriesStat { color:var(--dim); font-size:12px; margin-top:6px; }
   #seriesStat b { color:var(--ok); }
+  #libBtn.on { background:var(--accent); color:#fff; border-color:var(--accent); }
   #seriesStat i { color:#e0b05a; font-style:normal; }
   #seriesStat u { color:#ff7a7a; text-decoration:none; }
   #epList { flex:1; overflow-y:auto; padding:6px 10px; }
@@ -1579,8 +1894,9 @@ PAGE_HTML = r"""<!doctype html>
   .row.junk .name { color:var(--dim); }
   .kind { flex:none; font-size:10px; padding:0 5px; border-radius:3px;
           background:#2b3140; color:var(--dim); }
-  #loginBtn { background:#222836; border:1px solid var(--line); color:var(--dim); flex:none; }
-  #loginBtn:hover { color:var(--text); }
+  #loginBtn, #outBtn { background:#222836; border:1px solid var(--line); color:var(--dim);
+                       flex:none; border-radius:6px; padding:6px 10px; font-size:12px; }
+  #loginBtn:hover, #outBtn:hover { color:var(--text); }
   #driveSel { background:#222836; border:1px solid var(--line); color:var(--dim);
               flex:none; border-radius:6px; padding:5px 6px; font:inherit; }
   #driveSel:hover { color:var(--text); }
@@ -1724,7 +2040,16 @@ PAGE_HTML = r"""<!doctype html>
   }
 </style>
 </head>
-<body>
+<body class="anon">
+<div id="gate"><div class="box">
+  <h2>MediaFans</h2>
+  <div class="dim">请登录</div>
+  <input id="gu" placeholder="用户名" autocomplete="username" spellcheck="false">
+  <input id="gp" type="password" placeholder="密码" autocomplete="current-password"
+         onkeydown="if(event.key==='Enter')doLogin()">
+  <button onclick="doLogin()">登录</button>
+  <div class="err" id="gerr"></div>
+</div></div>
 <header>
   <h1>▶ MediaFans</h1>
   <div class="searchbar">
@@ -1732,7 +2057,9 @@ PAGE_HTML = r"""<!doctype html>
            onkeydown="if(event.key==='Enter')searchMedia()">
     <button onclick="searchMedia()">搜索</button>
   </div>
-  <button id="loginBtn" onclick="openLogin()">登录</button>
+  <span id="whoami"></span>
+  <button id="loginBtn" onclick="openLogin()">网盘登录</button>
+  <button id="outBtn" onclick="doLogout()" title="退出账号">退出</button>
   <select id="driveSel" title="当前网盘：我的网盘 / 剧集 / 一键找片都作用于此盘" onchange="setDrive(this.value)">
     <option value="quark">夸克</option>
     <option value="baidu">百度</option>
@@ -1789,6 +2116,7 @@ PAGE_HTML = r"""<!doctype html>
     <nav id="tabs">
       <button class="tab active" id="tabbtn-shows" onclick="switchTab('shows')">发现</button>
       <button class="tab" id="tabbtn-series" onclick="switchTab('series')">剧集</button>
+      <button class="tab" id="tabbtn-lib" onclick="switchTab('lib')">我的片库</button>
       <button class="tab" id="tabbtn-watch" onclick="switchTab('watch')">最近观看</button>
       <button class="tab" id="tabbtn-search" onclick="switchTab('search')">搜资源</button>
       <button class="tab" id="tabbtn-mine" onclick="switchTab('mine')">我的网盘</button>
@@ -1804,10 +2132,14 @@ PAGE_HTML = r"""<!doctype html>
         <div id="scanLog"></div>
         <div id="seriesFoot">
           <span class="grow" id="seriesDir"></span>
+          <button id="libBtn" onclick="toggleLibrary()">＋ 加入片库</button>
           <button id="grabBtn" style="display:none" onclick="fetchSeason()">一键转存</button>
           <button id="scanBtn" style="display:none" onclick="scanSources()">找缺失的集</button>
         </div>
       </div>
+    </div>
+    <div id="tab-lib" class="tabpane" style="display:none">
+      <div id="libList"><div class="empty">片库是空的</div></div>
     </div>
     <div id="tab-watch" class="tabpane" style="display:none">
       <div id="watchList"><div class="empty">还没有看过的记录</div></div>
@@ -2256,6 +2588,153 @@ function switchSource(c) {
 function nextBestCopy() {
   const others = curCopies.filter(c => c.path !== curPath);
   return others.find(c => !risky(c)) || others[0] || null;
+}
+
+// ---------------- 我的片库 ----------------
+// 片库是**展示层**：只记「在追哪部作品」，不记文件在哪——文件属于资源层，
+// 会被转存、替换、删除。所以这里点进去是回作品页，由它去问当前有哪些文件。
+async function renderLibrary() {
+  const box = $('#libList');
+  const cached = cacheGet('library');
+  if (cached && cached.length) paintLibrary(cached);
+  busy(true);
+  try {
+    const d = await (await fetch('/api/library')).json();
+    if (d.error) throw new Error(d.error);
+    cachePut('library', d.items || []);
+    paintLibrary(d.items || []);
+  } catch (e) {
+    if (!cached) box.innerHTML = '<div class="empty">读取失败：' + e.message + '</div>';
+  } finally {
+    busy(false);
+  }
+}
+
+function paintLibrary(items) {
+  const box = $('#libList');
+  box.innerHTML = '';
+  if (!items.length) {
+    box.innerHTML = '<div class="empty">片库是空的<br>'
+      + '<span class="dim">在「发现」或作品页点「加入片库」，这里就有了</span></div>';
+    return;
+  }
+  for (const it of items) box.appendChild(libRow(it));
+}
+
+function libRow(it) {
+  const row = el('div', 'wrow');
+  if (it.poster) {
+    const img = document.createElement('img');
+    img.src = it.poster; img.loading = 'lazy'; img.alt = it.title;
+    row.appendChild(img);
+  } else {
+    row.appendChild(el('div', 'noposter', it.title || '作品'));
+  }
+  const body = el('div', 'body');
+  body.appendChild(el('div', 't', it.title || ('#' + it.tmdb_id)));
+  const w = it.watched;
+  const bits = [it.media_type === 'movie' ? '电影' : '剧集'];
+  if (it.year) bits.push(it.year);
+  if (w) {
+    bits.push(w.finished ? '已看完'
+      : (w.season && w.episode ? `看到第${w.season}季 第${w.episode}集 ${w.percent}%`
+                               : `看到 ${w.percent}%`));
+  }
+  body.appendChild(el('div', 's', bits.join('　·　')));
+  if (w && w.percent && !w.finished) {
+    const bar = el('div', 'bar');
+    const fill = document.createElement('i');
+    fill.style.width = w.percent + '%';
+    bar.appendChild(fill);
+    body.appendChild(bar);
+  }
+  row.appendChild(body);
+  const x = el('button', 'x', '×');
+  x.title = '从片库移除';
+  x.onclick = (e) => {
+    e.stopPropagation();
+    fetch('/api/library/remove', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tmdb_id: it.tmdb_id, media_type: it.media_type }),
+    }).then(() => { cachePut('library', null); renderLibrary(); });
+  };
+  row.appendChild(x);
+  row.onclick = () => openSeries({ tmdb_id: it.tmdb_id, title: it.title, year: it.year,
+                                   poster: it.poster, media_type: it.media_type },
+                                 it.season || 1);
+  return row;
+}
+
+// 作品页上的「加入片库 / 已在片库」
+let inLibrary = false;
+
+async function toggleLibrary() {
+  const w = series && series.data;
+  if (!w) return;
+  const body = { tmdb_id: w.tmdb_id, media_type: w.media_type || 'tv',
+                 title: w.title, year: w.year || (seriesShow && seriesShow.year) || '',
+                 poster: w.poster || (seriesShow && seriesShow.poster) || '',
+                 season: w.season };
+  const url = inLibrary ? '/api/library/remove' : '/api/library/add';
+  try {
+    const d = await (await fetch(url, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) })).json();
+    if (d.error) throw new Error(d.error);
+    inLibrary = !!d.in_library;
+    paintLibButton();
+    cachePut('library', null);
+  } catch (e) { reportError(e.message, curNd); }
+}
+
+function paintLibButton() {
+  const b = $('#libBtn');
+  if (!b) return;
+  b.textContent = inLibrary ? '✓ 已在片库' : '＋ 加入片库';
+  b.classList.toggle('on', inLibrary);
+}
+
+// ---------------- 登录 ----------------
+let me = null;
+
+async function doLogin() {
+  const u = $('#gu').value.trim(), p = $('#gp').value;
+  const err = $('#gerr');
+  if (!u || !p) { err.textContent = '用户名和密码都要填'; return; }
+  err.textContent = '登录中…';
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p }),
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    // 令牌种进 cookie：之后所有子请求（含 <video src>）自动带上
+    document.cookie = 'mf_token=' + d.token + '; Path=/; SameSite=Lax; Max-Age=2592000';
+    me = d.user;
+    err.textContent = '';
+    enter();
+  } catch (e) {
+    err.textContent = e.message || '登录失败';
+  }
+}
+
+async function doLogout() {
+  try { await fetch('/api/logout', { method: 'POST' }); } catch (e) {}
+  document.cookie = 'mf_token=; Path=/; Max-Age=0';
+  location.reload();
+}
+
+// 登录之后才真正把界面跑起来
+function enter() {
+  document.body.classList.remove('anon');
+  $('#whoami').textContent = me ? (me.name + (me.admin ? '（管理员）' : '')) : '';
+  // 没有浏览网盘权限的用户，「我的网盘」这一页对他没意义
+  if (me && !me.can_browse) {
+    const t = $('#tabbtn-mine');
+    if (t) t.style.display = 'none';
+  }
+  boot();
 }
 
 // ---------------- 防呆：忙碌态 ----------------
@@ -3029,7 +3508,7 @@ function el(tag, cls, text) {
 
 let showsLoaded = false;
 let mineLoaded = false;
-const TABS = ['shows', 'series', 'watch', 'search', 'mine'];
+const TABS = ['shows', 'series', 'lib', 'watch', 'search', 'mine'];
 
 function switchTab(name) {
   for (const t of TABS) {
@@ -3040,6 +3519,7 @@ function switchTab(name) {
   // 那两页点一下就要看片，把播放器压到 24vh 反而挡事。
   document.body.classList.toggle('tab-search', name === 'search' || name === 'shows');
   if (name === 'shows' && !showsLoaded) { showsLoaded = true; setDiscoverMedia('tv'); }
+  if (name === 'lib') renderLibrary();
   if (name === 'watch') renderWatch();
   if (name === 'mine' && !mineLoaded) { mineLoaded = true; loadDir(''); }
 }
@@ -3568,6 +4048,13 @@ async function loadSeason(tmdbId, season, refresh, media) {
     series.data = d;
     renderSeasons(d);
     renderEpisodes(d);
+    // 这部作品在不在我的片库里
+    try {
+      const lib = await (await fetch('/api/library')).json();
+      inLibrary = (lib.items || []).some(
+        x => x.tmdb_id === d.tmdb_id && x.media_type === (d.media_type || 'tv'));
+    } catch (e) { inLibrary = false; }
+    paintLibButton();
   } catch (e) {
     if (seq !== seasonSeq) return;
     reportError(e.message, curNd);
@@ -4020,7 +4507,7 @@ function pollLogin(sid) {
 
 // 落在哪一页：带了 path 参数是冲着网盘目录来的；
 // 否则有没看完的就落到「最近观看」（接着看是最常见的意图），没有就去「追剧」。
-(async function boot() {
+async function boot() {
   const wantPath = params.get('path');
   if (wantPath) { loadDir(wantPath); switchTab('mine'); return; }
   const before = showsSeq;
@@ -4033,6 +4520,21 @@ function pollLogin(sid) {
   // 那就别再把他切走、也别用榜单盖掉他的搜索结果。
   if (showsSeq !== before) return;
   switchTab(has ? 'watch' : 'shows');
+}
+
+// 开屏先问「我是谁」：cookie 里已有有效令牌就直接进，否则盖上登录框。
+// 页面本身不要求登录就能拿到（见服务端 _is_entry 的注释），
+// 所以「有没有登录」必须由这一步决定，而不是靠能不能打开页面。
+(async function start() {
+  try {
+    const r = await fetch('/api/me');
+    if (r.ok) {
+      const d = await r.json();
+      if (d.user) { me = d.user; enter(); return; }
+    }
+  } catch (e) {}
+  document.body.classList.add('anon');
+  setTimeout(() => { try { $('#gu').focus(); } catch (e) {} }, 50);
 })();
 </script>
 </body>

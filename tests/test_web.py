@@ -565,6 +565,11 @@ def test_token_check_logic(upstream_url):
         checker = handler._authorized
 
         class Fake:
+            # _authorized 现在会把「当前是谁」挂到线程上，它靠这两个小助手
+            # 从 query / cookie 里取令牌
+            _bearer = handler._bearer
+            _client_ip = handler._client_ip
+
             def __init__(self, addr, cookie=""):
                 self.client_address = (addr, 1234)
                 self.headers = {"Cookie": cookie} if cookie else {}
@@ -694,9 +699,13 @@ def test_proxied_requests_do_not_get_the_loopback_exemption(upstream_url):
     app = make_webapp(upstream_url)
     app.token = "SECRET"
     try:
-        checker = app._make_handler()._authorized
+        handler = app._make_handler()
+        checker = handler._authorized
 
         class Fake:
+            _bearer = handler._bearer
+            _client_ip = handler._client_ip
+
             def __init__(self, headers):
                 self.client_address = ("127.0.0.1", 1234)
                 self.headers = httpx.Headers(headers)
@@ -1530,3 +1539,193 @@ def test_mobile_portrait_collapses_player_rows_so_episodes_are_reachable():
     assert "body.has-video:not(.pexp) #navbar" in mobile
     # 桌面上这一条不显示
     assert "#pbar { display:none; }" in PAGE_HTML
+
+
+# ---------------------------------------------------------------- 多用户 / 防扫描
+def _auth_app(upstream_url, tmp_path, entry=""):
+    app = make_webapp(upstream_url)
+    app.token = ""                     # 不用共享令牌，走账号
+    app.entry = entry
+    from mediafans.accounts import Accounts
+
+    app.accounts = Accounts(tmp_path / "users.json")
+    app.watch_path = tmp_path / "watch.json"
+    app.watch = __import__("mediafans.watch", fromlist=["WatchStore"]).WatchStore(
+        app.watch_path)
+    app._watch_stores = {}
+    app.accounts.add("root", "hunter22", admin=True)
+    app.accounts.add("kid", "hunter22")
+    return app
+
+
+def test_secret_entry_makes_the_root_look_like_nothing_is_there(upstream_url, tmp_path):
+    """公网上的登录页早晚会被扫。根路径回 404，和「这个站不存在」一模一样。
+
+    刻意不用 401/403——那等于告诉扫描器「猜对路径了，只差认证」。
+    """
+    app = _auth_app(upstream_url, tmp_path, entry="s3cret")
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        r = httpx.get(base + "/", timeout=10)
+        assert r.status_code == 404
+        assert "MediaFans" not in r.text          # 连品牌都不该漏
+        assert httpx.get(base + "/index.html", timeout=10).status_code == 404
+        assert httpx.get(base + "/login", timeout=10).status_code == 404
+        # 入口路径才给页面
+        r = httpx.get(base + "/s3cret", timeout=10)
+        assert r.status_code == 200 and "MediaFans" in r.text
+    finally:
+        app.stop()
+
+
+def test_without_an_entry_the_root_still_works(upstream_url, tmp_path):
+    """没配 entry 就别为这个多绕一层——本机自用的默认路径不该变复杂."""
+    app = _auth_app(upstream_url, tmp_path)
+    try:
+        r = httpx.get(f"http://127.0.0.1:{app.port}/", timeout=10)
+        assert r.status_code == 200
+    finally:
+        app.stop()
+
+
+def test_login_issues_a_token_that_authorizes_apis(upstream_url, tmp_path):
+    app = _auth_app(upstream_url, tmp_path)
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        bad = httpx.post(base + "/api/login",
+                         json={"username": "root", "password": "nope"}, timeout=10)
+        assert bad.status_code == 401 and "token" not in bad.json()
+        r = httpx.post(base + "/api/login",
+                       json={"username": "root", "password": "hunter22"}, timeout=10)
+        assert r.status_code == 200
+        tok = r.json()["token"]
+        assert r.json()["user"]["name"] == "root" and r.json()["user"]["admin"]
+        assert "password" not in r.text
+        me = httpx.get(base + "/api/me", cookies={"mf_token": tok}, timeout=10).json()
+        assert me["user"]["name"] == "root"
+        # 退出之后这个令牌立刻作废
+        httpx.post(base + "/api/logout", cookies={"mf_token": tok}, timeout=10)
+        assert app.accounts.resolve(tok) is None
+    finally:
+        app.stop()
+
+
+def test_library_and_progress_do_not_leak_between_users(upstream_url, tmp_path):
+    """资源共用、展示分开：两个人看同一个文件，片库和进度互不可见。"""
+    app = _auth_app(upstream_url, tmp_path)
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        def tok(name):
+            return httpx.post(base + "/api/login",
+                              json={"username": name, "password": "hunter22"},
+                              timeout=10).json()["token"]
+
+        a, b = tok("root"), tok("kid")
+        httpx.post(base + "/api/library/add", cookies={"mf_token": a},
+                   json={"tmdb_id": 125988, "title": "末日地堡", "season": 2}, timeout=10)
+        httpx.post(base + "/api/watch", cookies={"mf_token": a},
+                   json={"path": "/d/E01.mkv", "position": 600, "duration": 3000,
+                         "tmdb_id": 125988, "season": 2, "episode": 1}, timeout=10)
+
+        ra = httpx.get(base + "/api/library", cookies={"mf_token": a}, timeout=10).json()
+        rb = httpx.get(base + "/api/library", cookies={"mf_token": b}, timeout=10).json()
+        assert [i["tmdb_id"] for i in ra["items"]] == [125988]
+        assert rb["items"] == []
+
+        wa = httpx.get(base + "/api/watch/recent", cookies={"mf_token": a},
+                       timeout=10).json()["items"]
+        wb = httpx.get(base + "/api/watch/recent", cookies={"mf_token": b},
+                       timeout=10).json()["items"]
+        assert len(wa) == 1 and wb == []
+    finally:
+        app.stop()
+
+
+def test_browsing_the_whole_netdisk_needs_permission(upstream_url, tmp_path):
+    """网盘目录里什么都有：不给授权的话片库这一层就白分了."""
+    app = _auth_app(upstream_url, tmp_path)
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        def tok(name):
+            return httpx.post(base + "/api/login",
+                              json={"username": name, "password": "hunter22"},
+                              timeout=10).json()["token"]
+
+        kid = tok("kid")
+        r = httpx.get(base + "/api/list", params={"path": "/MediaFans"},
+                      cookies={"mf_token": kid}, timeout=10)
+        assert "权限" in r.json().get("error", "")
+        # 管理员开通之后就能看
+        app.accounts.set_flags("kid", can_browse=True)
+        r = httpx.get(base + "/api/list", params={"path": "/MediaFans"},
+                      cookies={"mf_token": tok("kid")}, timeout=10)
+        assert "files" in r.json()
+        # 管理员一直能看
+        r = httpx.get(base + "/api/list", params={"path": "/MediaFans"},
+                      cookies={"mf_token": tok("root")}, timeout=10)
+        assert "files" in r.json()
+    finally:
+        app.stop()
+
+
+def test_only_admins_manage_users_but_anyone_changes_own_password(upstream_url, tmp_path):
+    app = _auth_app(upstream_url, tmp_path)
+    base = f"http://127.0.0.1:{app.port}"
+    try:
+        def tok(name, pw="hunter22"):
+            return httpx.post(base + "/api/login",
+                              json={"username": name, "password": pw},
+                              timeout=10).json()["token"]
+
+        kid = tok("kid")
+        r = httpx.get(base + "/api/users", cookies={"mf_token": kid}, timeout=10)
+        assert "管理员" in r.json().get("error", "")
+        r = httpx.post(base + "/api/user/save", cookies={"mf_token": kid},
+                       json={"username": "kid2", "password": "hunter22"}, timeout=10)
+        assert "管理员" in r.json().get("error", "")
+        # 改自己的密码不用找管理员
+        r = httpx.post(base + "/api/user/save", cookies={"mf_token": kid},
+                       json={"username": "kid", "password": "newpass1"}, timeout=10)
+        assert r.json().get("ok")
+        assert app.accounts.login("kid", "newpass1")
+        # 但不能给自己提权
+        r = httpx.post(base + "/api/user/save", cookies={"mf_token": tok("kid", "newpass1")},
+                       json={"username": "kid", "admin": True}, timeout=10)
+        assert app.accounts.get("kid").admin is False
+    finally:
+        app.stop()
+
+
+def test_page_carries_a_login_gate():
+    from mediafans.web import PAGE_HTML
+
+    assert 'id="gate"' in PAGE_HTML and "function doLogin" in PAGE_HTML
+    # 页面不要求登录就能拿到（否则 401 本身也是一种「这里有东西」的信号），
+    # 所以是否登录必须由 /api/me 决定
+    assert "fetch('/api/me')" in PAGE_HTML
+    assert 'body.anon > header, body.anon main { visibility:hidden; }' in PAGE_HTML
+
+
+def test_scanner_gets_404_everywhere_not_401(upstream_url, tmp_path):
+    """根路径 404 而 /wp-login.php 回 401 的话，不一致本身就是信号。
+
+    只有真实存在的路径（/api/、/stream）才配拿到 401。
+    """
+    app = _auth_app(upstream_url, tmp_path, entry="s3cret")
+    base = f"http://127.0.0.1:{app.port}"
+    # 测试客户端是回环地址，会吃到「本机免验」。真实的公网请求都经 nginx 过来、
+    # 一定带 X-Forwarded-For，加上它才是扫描器看到的样子。
+    ext = {"X-Forwarded-For": "203.0.113.9"}
+    try:
+        for p in ("/", "/index.html", "/login", "/admin", "/.env",
+                  "/wp-login.php", "/static/app.js"):
+            assert httpx.get(base + p, headers=ext, timeout=10).status_code == 404, p
+        # 真实端点没登录才是 401
+        assert httpx.get(base + "/api/me", headers=ext, timeout=10).status_code == 401
+        assert httpx.post(base + "/api/library/add", json={}, headers=ext,
+                          timeout=10).status_code == 401
+        # POST 到不存在的路径也是 404
+        assert httpx.post(base + "/wp-login.php", json={}, headers=ext,
+                          timeout=10).status_code == 404
+    finally:
+        app.stop()

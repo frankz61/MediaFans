@@ -169,6 +169,12 @@ def watch_file_for(cfg: Config) -> Path:
     return base / "watch.json"
 
 
+def accounts_file_for(cfg: Config) -> Path:
+    """账号、会话、片库（跟凭据同目录，一起管理；里面有密码哈希，chmod 600）."""
+    base = cfg.path.parent if cfg.path else (Path.home() / ".mediafans")
+    return base / "users.json"
+
+
 def load_config(explicit: Optional[str] = None) -> Config:
     path = discover_config_path(explicit)
     if path is None:

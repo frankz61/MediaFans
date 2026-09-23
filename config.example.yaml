@@ -94,3 +94,9 @@ player:
   # 例（数组，推荐）:
   # command: ["mpv", "--force-media-title={title}", "{url}"]
   command: ""
+
+web:
+  # 防扫描入口。配了之后登录页只在 https://主机:端口/<entry> 上出现，
+  # 根路径和一切不存在的路径都回 404（连品牌都不漏）。留空则根路径就是入口。
+  # 账号用 `mediafans user add` 建，不写在配置里。
+  # entry: <随机串>
