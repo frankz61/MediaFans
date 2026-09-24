@@ -12,7 +12,9 @@ import java.net.URLEncoder
 /**
  * 服务端地址和访问令牌。
  *
- * 网页端把令牌放在 URL 的 query 里，电视上没法每次手打，所以存起来。
+ * 令牌有两种来源：账号密码登录换来的会话令牌（按人分片库和进度），
+ * 或者服务端启动参数 `--token` 那个共享令牌（视为管理员，老版本就用它）。
+ * 电视上没法每次手打，所以存起来。
  * 存的是 SharedPreferences —— 电视是家里自己的设备，不值得为此上 EncryptedSharedPreferences
  * （那会把 minSdk 顶上去，老盒子反而装不了）。
  */
@@ -27,6 +29,14 @@ class Settings(ctx: Context) {
         get() = sp.getString("token", "")!!
         set(v) = sp.edit().putString("token", v.trim()).apply()
 
+    /** 登录的是谁。`_master` = 共享令牌（管理员，没有自己的片库）；空 = 还没验过。 */
+    var user: String
+        get() = sp.getString("user", "")!!
+        set(v) = sp.edit().putString("user", v).apply()
+
+    /** 是不是一个真账号。共享令牌对应的内建管理员不在账号表里，片库对它不生效。 */
+    val hasAccount: Boolean get() = user.isNotEmpty() && user != MASTER
+
     /** 网盘：quark / baidu。电视端只切换，不做登录——扫码在网页端做更方便。 */
     var netdisk: String
         get() = sp.getString("nd", "quark")!!
@@ -37,7 +47,38 @@ class Settings(ctx: Context) {
         get() = sp.getString("quality", "")!!
         set(v) = sp.edit().putString("quality", v).apply()
 
+    /**
+     * 字幕偏好，跨文件沿用：空 = 自动（有中文就开）；`off` = 关；
+     * 其余是语言码（用户用字幕键手动选过的那条的语言）。
+     */
+    var subtitle: String
+        get() = sp.getString("subtitle", "")!!
+        set(v) = sp.edit().putString("subtitle", v).apply()
+
     val configured: Boolean get() = base.isNotEmpty()
+
+    companion object {
+        const val MASTER = "_master"
+    }
+}
+
+/**
+ * 把用户填的地址拆成「服务器地址 + 令牌」。
+ *
+ * 最常见的填法是直接把网页端地址栏整个抄过来，里面带着 `?token=...`，
+ * 甚至还带着防扫描入口路径（`https://host/<entry>`）。令牌抠出来单独存；
+ * 路径先留着，连不上时 [Api.resolveBase] 会退到根路径再试——
+ * 接口永远挂在根上（`/api/...`），入口路径只管网页。
+ */
+fun splitAddress(raw: String): Pair<String, String> {
+    var s = raw.trim()
+    if (s.isEmpty()) return "" to ""
+    if (!s.startsWith("http://") && !s.startsWith("https://")) s = "http://$s"
+    val u = Uri.parse(s)
+    val token = runCatching { u.getQueryParameter("token") }.getOrNull().orEmpty()
+    val base = u.buildUpon().clearQuery().fragment(null).build().toString()
+        .trimEnd('/')
+    return base to token
 }
 
 // ---------------------------------------------------------------- 数据模型
@@ -71,6 +112,25 @@ data class Source(
 )
 
 data class Watched(val percent: Int, val finished: Boolean, val resumeAt: Int, val path: String)
+
+/** 外挂字幕。服务端已经转成 WebVTT 了（srt/ass 都是），这边只管挂上去。 */
+data class Subtitle(val label: String, val lang: String, val url: String)
+
+/** 片库里的一条：只记「在追哪部」，进度是服务端顺带贴上的。 */
+data class LibItem(
+    val tmdbId: Int,
+    val mediaType: String,
+    val title: String,
+    val year: String,
+    val poster: String,
+    val season: Int?,
+    val watchedSeason: Int?,
+    val watchedEpisode: Int?,
+    val percent: Int,
+    val finished: Boolean,
+)
+
+data class Me(val name: String, val admin: Boolean)
 
 data class Episode(
     val episode: Int,
@@ -178,7 +238,8 @@ data class RecentItem(
 
 // ---------------------------------------------------------------- HTTP
 
-class ApiError(message: String) : Exception(message)
+/** [needLogin]：服务端回了 401——令牌过期、被改密码作废、或者压根不对。该回登录页了。 */
+class ApiError(message: String, val needLogin: Boolean = false) : Exception(message)
 
 /**
  * 服务端 REST 客户端。
@@ -188,10 +249,15 @@ class ApiError(message: String) : Exception(message)
  */
 class Api(private val settings: Settings) {
 
-    private fun url(path: String, params: Map<String, String> = emptyMap()): String {
-        val sb = StringBuilder(settings.base).append(path)
+    private fun url(
+        path: String,
+        params: Map<String, String> = emptyMap(),
+        base: String = settings.base,
+        auth: Boolean = true,
+    ): String {
+        val sb = StringBuilder(base).append(path)
         val all = LinkedHashMap(params)
-        if (settings.token.isNotEmpty()) all["token"] = settings.token
+        if (auth && settings.token.isNotEmpty()) all["token"] = settings.token
         if (all.isNotEmpty()) {
             sb.append('?')
             sb.append(all.entries.joinToString("&") {
@@ -202,7 +268,7 @@ class Api(private val settings: Settings) {
     }
 
     private fun request(method: String, full: String, body: String? = null): JSONObject {
-        if (settings.base.isEmpty()) throw ApiError("还没设置服务器地址")
+        if (full.startsWith("/")) throw ApiError("还没设置服务器地址")
         val c = (URL(full).openConnection() as HttpURLConnection).apply {
             requestMethod = method
             connectTimeout = 15000
@@ -222,8 +288,16 @@ class Api(private val settings: Settings) {
             val obj = try {
                 JSONObject(text)
             } catch (e: Exception) {
-                // 令牌不对时服务端会返回一段 HTML，直接抛「JSON 解析失败」看不懂
-                throw ApiError(if (code == 403) "访问令牌不对" else "HTTP $code：返回的不是 JSON")
+                // 返回的是 HTML：多半是地址填错了——服务端对不认识的路径一律回
+                // 一个标准 404 页（防扫描），或者前面的 nginx 回了自己的错误页
+                throw ApiError(when (code) {
+                    404 -> "这个地址上没有 MediaFans 服务（HTTP 404），检查服务器地址"
+                    401, 403 -> "访问令牌不对"
+                    else -> "HTTP $code：返回的不是 JSON"
+                }, needLogin = code == 401 || code == 403)
+            }
+            if (code == 401) {
+                throw ApiError(obj.optString("error").ifEmpty { "需要登录" }, needLogin = true)
             }
             obj.optString("error").takeIf { it.isNotEmpty() }?.let { throw ApiError(it) }
             return obj
@@ -244,6 +318,87 @@ class Api(private val settings: Settings) {
         val sep = if (u.contains('?')) "&" else "?"
         val tok = if (settings.token.isEmpty()) "" else "${sep}token=${settings.token}"
         return settings.base + u + tok
+    }
+
+    // ------------------------------------------------------------ 账号
+
+    /**
+     * 找到接口真正挂在哪。先试用户填的原样，不行再退到根路径：
+     * 从网页端地址栏抄来的地址常带着入口路径，而接口永远在根上。
+     *
+     * 判据是 `/api/me` 回的是不是 JSON——没登录时它回 401 + JSON，
+     * 这就足以证明「这里是 MediaFans」，不需要先有令牌。
+     */
+    fun resolveBase(raw: String): String {
+        val u = Uri.parse(raw)
+        val root = "${u.scheme}://${u.encodedAuthority}"
+        val candidates = listOf(raw, root).distinct()
+        var last: Exception? = null
+        for (b in candidates) {
+            try {
+                request("GET", url("/api/me", base = b, auth = false))
+                return b
+            } catch (e: ApiError) {
+                if (e.needLogin) return b      // 401 JSON：地址对了，只差登录
+                last = e
+            } catch (e: Exception) {
+                last = e
+            }
+        }
+        throw ApiError("连不上服务器：${last?.message ?: raw}")
+    }
+
+    /** 账号密码换会话令牌。这一步本身不带令牌。 */
+    fun login(base: String, username: String, password: String): String =
+        request("POST", url("/api/login", base = base, auth = false),
+            JSONObject().put("username", username).put("password", password).toString())
+            .getString("token")
+
+    /** 当前令牌是谁。连带验证令牌还有没有效。 */
+    fun me(): Me {
+        val u = get("/api/me").getJSONObject("user")
+        return Me(u.optString("name"), u.optBoolean("admin"))
+    }
+
+    /** 服务端作废这个会话。失败也无所谓，本地照样清掉。 */
+    fun logout() {
+        runCatching { post("/api/logout", JSONObject()) }
+    }
+
+    // ------------------------------------------------------------ 片库
+
+    fun library(): List<LibItem> {
+        val a = get("/api/library").optJSONArray("items") ?: return emptyList()
+        return (0 until a.length()).map { i ->
+            val o = a.getJSONObject(i)
+            val w = o.optJSONObject("watched")
+            LibItem(
+                tmdbId = o.optInt("tmdb_id"),
+                mediaType = o.optString("media_type", "tv"),
+                title = o.optString("title"),
+                year = o.optString("year"),
+                poster = o.optString("poster"),
+                season = if (o.isNull("season")) null else o.optInt("season"),
+                watchedSeason = w?.let { if (it.isNull("season")) null else it.optInt("season") },
+                watchedEpisode = w?.let { if (it.isNull("episode")) null else it.optInt("episode") },
+                percent = w?.optInt("percent") ?: 0,
+                finished = w?.optBoolean("finished") ?: false,
+            )
+        }
+    }
+
+    fun libraryAdd(w: Work) {
+        post("/api/library/add", JSONObject().apply {
+            put("tmdb_id", w.tmdbId); put("media_type", w.mediaType)
+            put("title", w.title); put("year", w.year); put("poster", w.poster)
+            if (!w.isMovie) put("season", w.season)
+        })
+    }
+
+    fun libraryRemove(tmdbId: Int, mediaType: String) {
+        post("/api/library/remove", JSONObject().apply {
+            put("tmdb_id", tmdbId); put("media_type", mediaType)
+        })
     }
 
     // ------------------------------------------------------------ 榜单 / 搜索
@@ -269,12 +424,15 @@ class Api(private val settings: Settings) {
 
     // ------------------------------------------------------------ 作品
 
-    fun work(tmdbId: Int, season: Int, media: String, refresh: Boolean = false): Work {
+    fun work(
+        tmdbId: Int, season: Int, media: String, refresh: Boolean = false,
+        nd: String = settings.netdisk,
+    ): Work {
         val p = mutableMapOf(
             "tmdb_id" to tmdbId.toString(),
             "season" to season.toString(),
             "media" to media,
-            "nd" to settings.netdisk,
+            "nd" to nd,
         )
         if (refresh) p["refresh"] = "1"
         return get("/api/series", p).toWork()
@@ -349,8 +507,8 @@ class Api(private val settings: Settings) {
 
     // ------------------------------------------------------------ 播放
 
-    fun play(path: String): PlayInfo {
-        val o = get("/api/play", mapOf("path" to path, "nd" to settings.netdisk))
+    fun play(path: String, nd: String = settings.netdisk): PlayInfo {
+        val o = get("/api/play", mapOf("path" to path, "nd" to nd))
         val arr = o.optJSONArray("streams")
         val streams = (0 until (arr?.length() ?: 0)).map { i ->
             val s = arr!!.getJSONObject(i)
@@ -372,6 +530,19 @@ class Api(private val settings: Settings) {
             defaultKey = o.optString("default_key"),
             direct = o.optBoolean("direct"),
         )
+    }
+
+    /**
+     * 同目录的外挂字幕。拿不到就当没有——字幕是锦上添花，不该挡住播放。
+     * 地址是 `/subs?t=...`，跟 `/stream` 一样要带令牌，所以也过一遍 [absolute]。
+     */
+    fun subs(path: String, nd: String = settings.netdisk): List<Subtitle> {
+        val a = get("/api/subs", mapOf("path" to path, "nd" to nd))
+            .optJSONArray("items") ?: return emptyList()
+        return (0 until a.length()).map { i ->
+            val o = a.getJSONObject(i)
+            Subtitle(o.optString("label"), o.optString("lang"), absolute(o.optString("url")))
+        }
     }
 
     // ------------------------------------------------------------ 进度
@@ -401,8 +572,8 @@ class Api(private val settings: Settings) {
         }
     }
 
-    fun watchGet(path: String): Int =
-        get("/api/watch", mapOf("path" to path, "nd" to settings.netdisk))
+    fun watchGet(path: String, nd: String = settings.netdisk): Int =
+        get("/api/watch", mapOf("path" to path, "nd" to nd))
             .optJSONObject("mark")?.optInt("resume_at") ?: 0
 
     /** 上报进度。带上剧集上下文，「最近观看」才能按作品聚合而不是一堆孤立文件。 */
@@ -410,12 +581,13 @@ class Api(private val settings: Settings) {
         path: String, position: Double, duration: Double,
         tmdbId: Int?, season: Int?, episode: Int?, mediaType: String,
         title: String, year: String, poster: String, epTitle: String, name: String,
+        nd: String = settings.netdisk,
     ) {
         val body = JSONObject().apply {
             put("path", path)
             put("position", position)
             put("duration", duration)
-            put("netdisk", settings.netdisk)
+            put("netdisk", nd)
             put("media_type", mediaType)
             put("title", title)
             put("year", year)
@@ -432,18 +604,20 @@ class Api(private val settings: Settings) {
     // ------------------------------------------------------------ 转存
 
     /** 转存单个来源。同步返回，服务端这一步本身很快。 */
-    fun fetchEpisode(tmdbId: Int, season: Int, episode: Int, index: Int): String =
+    fun fetchEpisode(
+        tmdbId: Int, season: Int, episode: Int, index: Int, nd: String = settings.netdisk,
+    ): String =
         post("/api/episode/fetch", JSONObject().apply {
             put("tmdb_id", tmdbId); put("season", season)
             put("episode", episode); put("index", index)
-            put("netdisk", settings.netdisk)
+            put("netdisk", nd)
         }).optString("path")
 
     /** 找资源 / 转存全部版本都是后台任务，返回 job id 后轮询。 */
-    fun scan(tmdbId: Int, season: Int, media: String): String =
+    fun scan(tmdbId: Int, season: Int, media: String, nd: String = settings.netdisk): String =
         post("/api/series/scan", JSONObject().apply {
             put("tmdb_id", tmdbId); put("season", season)
-            put("media", media); put("netdisk", settings.netdisk)
+            put("media", media); put("netdisk", nd)
         }).getString("job")
 
     fun fetchAll(tmdbId: Int, season: Int, media: String, episode: Int): String =

@@ -14,8 +14,8 @@ android {
         // 这里取 23 是因为 tv-material 的最低要求。
         minSdk = 23
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     buildTypes {
