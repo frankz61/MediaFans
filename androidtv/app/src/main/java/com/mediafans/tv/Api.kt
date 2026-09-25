@@ -91,6 +91,8 @@ data class MediaItem(
     val mediaType: String,          // tv | movie
     val rating: Double,
     val overview: String,
+    /** 榜单里豆瓣按季上榜的剧（「花儿与少年 第八季」）：点进去直接落在这一季 */
+    val season: Int? = null,
 )
 
 data class Copy(
@@ -419,6 +421,7 @@ class Api(private val settings: Settings) {
             mediaType = o.optString("media_type", "tv"),
             rating = o.optDouble("rating", 0.0),
             overview = o.optString("overview"),
+            season = o.optInt("season").takeIf { it > 0 },
         )
     }
 

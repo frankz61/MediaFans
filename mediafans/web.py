@@ -176,6 +176,7 @@ class WebApp:
         self.logins = _LoginSessions()
         self.jobs = _AutoJobs()
         self._tmdb = None
+        self._douban = None
         from .agent import SeriesCache
 
         self.series_cache = SeriesCache()
@@ -189,6 +190,10 @@ class WebApp:
         # 其他用户各自一份 watch-<用户名>.json
         self.watch = WatchStore(self.watch_path)
         self._watch_stores: dict = {}
+        # 豆瓣 id -> (ts, (TMDB 条目, 季) | None)。对上的落盘：每次部署都重启，
+        # 不存的话重启后头一回打开，每个榜都要重新搜几十趟 TMDB（实测单榜 13 秒）
+        self._douban_map_path = self.watch_path.parent / "douban_tmdb.json"
+        self._douban_map: dict = self._load_douban_map()
 
         from .accounts import Accounts
 
@@ -625,29 +630,49 @@ class WebApp:
             self._tmdb = TmdbClient(self.tmdb_key, base_url=self.tmdb_base_url)
         return self._tmdb
 
-    # 榜单：剧集三档 + 电影三档。值是 (华语档参数, 全球榜端点名, media_type)
+    @property
+    def douban(self):
+        if self._douban is None:
+            from .metadata.douban import DoubanClient
+
+            self._douban = DoubanClient()
+        return self._douban
+
+    # 榜单。值是 (media_type, 华语段来源, 外语段的 TMDB 端点名)。
+    # 华语段来源：("collection", 豆瓣固定榜名) / ("hot", 豆瓣最近热门的媒体类型)
+    # / ("tmdb", TmdbClient.chinese_* 的档位参数)；外语段为 None 表示只有华语。
     DISCOVER = {
-        "airing": ("airing", "airing_today", "tv"),
-        "onair": ("onair", "on_the_air", "tv"),
-        "popular": ("popular", "popular_tv", "tv"),
-        "now": ("now", "now_playing", "movie"),
-        "upcoming": ("upcoming", "upcoming", "movie"),
-        "hot": ("hot", "popular_movie", "movie"),
+        "popular": ("tv", ("collection", "tv_domestic"), "popular_tv"),
+        "praise": ("tv", ("collection", "tv_chinese_best_weekly"), "popular_tv"),
+        "variety": ("tv", ("collection", "show_domestic"), None),
+        "now": ("movie", ("collection", "movie_showing"), "now_playing"),
+        "upcoming": ("movie", ("collection", "movie_soon"), "upcoming"),
+        "hot": ("movie", ("hot", "movie"), "popular_movie"),
+        # 豆瓣没有排期数据，这两档网页端已经不列了；1.1 的电视端首页还在要，
+        # 照旧整个走 TMDB，老版本不至于一升级服务端就少两行
+        "airing": ("tv", ("tmdb", "airing"), "airing_today"),
+        "onair": ("tv", ("tmdb", "onair"), "on_the_air"),
     }
 
-    # 榜单缓存多久。榜单一天变不了几次，而每次首屏都要为它打两趟 TMDB
-    # （华语一档 + 全球一档），是首屏最慢的一段。10 分钟内重复打开直接给缓存。
+    # 榜单缓存多久。榜单一天变不了几次，而每次首屏都要为它打一趟豆瓣 + 一趟 TMDB，
+    # 是首屏最慢的一段。10 分钟内重复打开直接给缓存。
     DISCOVER_TTL = 600.0
+    # 豆瓣条目对 TMDB 的结果。对上的一直留着（一部剧的 tmdb_id 不会变）；
+    # 没对上的过一阵再试——新剧往往是开播几天后才有人录进 TMDB
+    DOUBAN_MISS_TTL = 6 * 3600.0
 
-    def api_discover(self, kind: str = "airing") -> dict:
+    def api_discover(self, kind: str = "popular") -> dict:
         """榜单，华语在前。剧集和电影共用一个端点，靠 kind 分。
 
-        TMDB 的榜单是全球榜，被各国日播肥皂剧刷屏，华语内容基本挤不进去。
-        所以华语单独用 /discover 取一档摆在前面，全球榜接在后面——是「优先」
-        不是「只要」，外语新片新剧还在，只是不占满第一屏。
+        华语段来自豆瓣，外语段来自 TMDB。TMDB 的榜单是全球榜，被各国日播肥皂剧刷屏，
+        华语内容挤不进去；它自己的 /discover 按语言筛出来的又是「全球用户眼里的热门」，
+        跟国内正在追的对不上，综艺几乎是空白。豆瓣是国内的口径。
+        外语段就只留外语——华语已经由豆瓣那段管了，混进来反而会重复或排序打架。
         """
         if not self.tmdb:
             raise MediaFansError("未配置 tmdb.api_key，无法拉取榜单")
+        if kind not in self.DISCOVER:
+            kind = "popular"
         now = time.time()
         with self._discover_lock:
             hit = self._discover_cache.get(kind)
@@ -659,31 +684,157 @@ class WebApp:
         return dict(result, cached=False)
 
     def _discover_fresh(self, kind: str) -> dict:
-        cn_kind, global_fn, media = self.DISCOVER.get(kind) or self.DISCOVER["airing"]
-        chinese_fn = self.tmdb.chinese_movie if media == "movie" else self.tmdb.chinese_tv
-        fn = getattr(self.tmdb, global_fn)
+        media, (src, arg), global_fn = self.DISCOVER[kind]
         what = "电影" if media == "movie" else "剧集"
-        items, note = [], ""
-        if self.prefer_chinese:
+        rows, note = [], ""
+        if self.prefer_chinese or global_fn is None:
             try:
-                items = chinese_fn(cn_kind)
+                rows = self._chinese_rows(media, src, arg)
             except Exception as e:
+                if global_fn is None:
+                    raise MediaFansError(f"拉取{what}榜失败: {str(e)[:120]}")
                 # 华语这一档挂了不该让整个榜打不开，但也不能不吭声
-                note = f"华语榜没拉到（{str(e)[:60]}），下面是全球榜"
-        try:
-            seen = {i.tmdb_id for i in items}
-            items += [i for i in fn() if i.tmdb_id not in seen]
-        except Exception as e:
-            if not items:
-                raise MediaFansError(f"拉取{what}榜失败: {str(e)[:120]}")
-            note = f"全球榜没拉到（{str(e)[:60]}），下面只有华语"
-        return {"kind": kind, "media_type": media, "note": note, "items": [{
+                note = f"华语榜没拉到（{str(e)[:60]}），下面是其他语种"
+        if global_fn:
+            try:
+                rows += self._foreign_rows(global_fn, media, {r["tmdb_id"] for r in rows})
+            except Exception as e:
+                if not rows:
+                    raise MediaFansError(f"拉取{what}榜失败: {str(e)[:120]}")
+                note = f"外语榜没拉到（{str(e)[:60]}），下面只有华语"
+        return {"kind": kind, "media_type": media, "note": note, "items": rows}
+
+    def _tmdb_row(self, i, media: str, **extra) -> dict:
+        return dict({
             "title": i.title, "original": i.original_title, "year": i.year,
             "rating": i.rating, "overview": i.overview, "media_type": media,
             "chinese": self.tmdb.is_chinese(i),
             "animation": self.tmdb.is_animation(i),
             "poster": i.poster, "tmdb_id": i.tmdb_id,
-        } for i in items]}
+        }, **extra)
+
+    def _chinese_rows(self, media: str, src: str, arg: str) -> List[dict]:
+        if src == "tmdb":
+            fn = self.tmdb.chinese_movie if media == "movie" else self.tmdb.chinese_tv
+            return [self._tmdb_row(i, media) for i in fn(arg)]
+        entries = (self.douban.collection(arg) if src == "collection"
+                   else self.douban.recent_hot(arg))
+        # 影院热映、即将上映是全部地区混排的，只取华语
+        entries = [e for e in entries if e.chinese and e.media_type == media]
+        rows, seen = [], set()
+        for e, hit in zip(entries, self._douban_to_tmdb(entries)):
+            if not hit or hit[0].tmdb_id in seen:
+                continue
+            item, season = hit
+            seen.add(item.tmdb_id)
+            # 片名、简介、海报用 TMDB 的：找资源和作品页都按 TMDB 的片名走，
+            # 豆瓣海报还有防盗链（不带 Referer 回 418，而网页是 no-referrer）。
+            # 年份和评分用豆瓣的：「花儿与少年 第八季」该显示 2026，不是第一季的 2014
+            # 评分只用豆瓣的：豆瓣 0 分是「评价人数不足」，这时退回 TMDB 的分反而误导——
+            # 实测《一瓯春》豆瓣暂无评分，TMDB 上几个人打出 9.5
+            rows.append(self._tmdb_row(
+                item, media, chinese=True,
+                year=e.year or item.year, rating=e.rating,
+                season=season, douban_id=e.douban_id))
+        return rows
+
+    # TMDB 的剧集热门榜被美国深夜秀、新闻、日播肥皂剧占满（实测前 20 条里十几条是这些），
+    # 以前有华语段挡在前面不显眼，外语单独成段后就成了一整行脱口秀。
+    # 新闻 / 肥皂剧 / 脱口秀 这三个类型没人会来网盘找，直接滤掉
+    FOREIGN_TV_SKIP_GENRES = {10763, 10766, 10767}
+
+    def _foreign_rows(self, global_fn: str, media: str, seen: set) -> List[dict]:
+        fn = getattr(self.tmdb, global_fn)
+        items = fn()
+        if media == "tv" and self.prefer_chinese:
+            # 滤掉一大半，再多拉一页才够一行
+            try:
+                items = items + fn(page=2)
+            except Exception:
+                pass
+            items = [i for i in items if not (set(i.genres or []) & self.FOREIGN_TV_SKIP_GENRES)]
+        if self.prefer_chinese:
+            items = [i for i in items if not self.tmdb.is_chinese(i)]
+        rows = []
+        for i in items:
+            if i.tmdb_id in seen:
+                continue
+            seen.add(i.tmdb_id)
+            rows.append(self._tmdb_row(i, media))
+        return rows
+
+    def _douban_to_tmdb(self, entries) -> list:
+        """每条豆瓣条目对应的 (TMDB 条目, 第几季)，对不上是 None。
+
+        一个榜几十条，头一回要搜几十次 TMDB（走境外中转），所以并发搜、结果长期缓存。
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        now = time.time()
+        out, todo = [], []
+        with self._discover_lock:
+            for e in entries:
+                hit = self._douban_map.get(e.douban_id)
+                if hit and (hit[1] is not None or now - hit[0] < self.DOUBAN_MISS_TTL):
+                    out.append(hit[1])
+                else:
+                    out.append(None)
+                    todo.append(len(out) - 1)
+        if todo:
+            def one(k):
+                try:
+                    return self._match_douban(entries[k]), None
+                except Exception as e:
+                    return None, e
+
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                found = list(ex.map(one, todo))
+            errors = [err for _, err in found if err]
+            with self._discover_lock:
+                for k, (got, err) in zip(todo, found):
+                    out[k] = got
+                    # 搜出错（中转抖了一下）不能记成「对不上」，不然这条要消失好几个小时
+                    if not err:
+                        self._douban_map[entries[k].douban_id] = (now, got)
+                if len(errors) < len(found):
+                    self._save_douban_map()
+            if errors and not any(out):
+                raise errors[0]
+        return out
+
+    def _load_douban_map(self) -> dict:
+        from .models import MediaItem
+
+        try:
+            raw = json.loads(self._douban_map_path.read_text(encoding="utf-8"))
+            return {k: (float(v.get("ts") or 0),
+                        (MediaItem(**v["item"]), v.get("season")) if v.get("item") else None)
+                    for k, v in raw.items()}
+        except Exception:
+            return {}
+
+    def _save_douban_map(self) -> None:
+        """没对上的也存（带时间）：重启后照样按 DOUBAN_MISS_TTL 到期再试。调用方持锁。"""
+        data = {k: ({"item": dataclasses.asdict(v[1][0]), "season": v[1][1]} if v[1]
+                    else {"ts": v[0]})
+                for k, v in self._douban_map.items()}
+        try:
+            tmp = self._douban_map_path.with_suffix(".tmp")
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self._douban_map_path)
+        except OSError:
+            pass
+
+    def _match_douban(self, e):
+        from .metadata.douban import pick_match, query_variants
+
+        for name, season, check_year in query_variants(e):
+            cands = self.tmdb.search(name, e.media_type, prefer_chinese=True)
+            got = pick_match(name, e.year, check_year, cands)
+            if got:
+                return got, season
+        return None
 
     def api_search_media(self, query: str) -> dict:
         """按作品搜（TMDB），不是搜分享链接。
@@ -1592,7 +1743,7 @@ class WebApp:
                     elif parsed.path == "/api/search/media":
                         self._json(200, app.api_search_media(query.get("kw", "")))
                     elif parsed.path == "/api/discover":
-                        self._json(200, app.api_discover(query.get("kind", "airing")))
+                        self._json(200, app.api_discover(query.get("kind", "popular")))
                     elif parsed.path == "/api/auto/status":
                         self._json(200, app.api_auto_status(query.get("job", "")))
                     elif parsed.path == "/api/login/poll":
@@ -3037,8 +3188,8 @@ function busy(on) {
 //
 // 上面那把锁是为「用户刚点了一下，别让他再点」设计的。stale-while-revalidate
 // 的后台刷新完全不是这个场景：内容已经画在屏幕上了，这时候把卡片禁掉是最糟的
-// 组合——看得见、点不动，和坏掉没区别。榜单冷缓存时后台那趟要好几秒到十几秒，
-// 锁这么久等于这一屏废了。
+// 组合——看得见、点不动，和坏掉没区别。榜单的华语段要按片名逐条对回 TMDB，
+// 冷缓存下单档实测 5–15 秒，锁这么久等于这一屏废了。
 function bgBusy(on) {
   bgflight = Math.max(0, bgflight + (on ? 1 : -1));
   document.body.classList.toggle('bgbusy', bgflight > 0);
@@ -3115,6 +3266,7 @@ async function playFile(f) {
     // 以前这里跟着 seq 一起被守卫掉了：连点两集，先发的那次回来时 seq 已经变了，
     // 它那一笔永远不减，inflight 卡在 ≥1，body.busy 再也不摘。于是整页的卡片、
     // 集号、导航、来源、清晰度全被 pointer-events:none 钉死，只能刷新页面。
+    // 榜单换成豆瓣后单档要 5–15 秒，这个窗口一下变得很容易踩到。
     // seq 守卫只该管它真正保护的状态（playInFlightPath），不该管计数。
     if (seq === playSeq) playInFlightPath = '';
     busy(false);
@@ -4101,7 +4253,7 @@ let autoTimer = null, autoDir = '';
 // 剧集和电影各三档。电影的「正在上映」在后端往前推了 45 天——院线片的热度
 // 窗口比剧集长，只取当天几乎是空的。
 const DISCOVER_KINDS = {
-  tv: [['airing', '今日播出'], ['onair', '一周在播'], ['popular', '热门']],
+  tv: [['popular', '热门'], ['praise', '口碑'], ['variety', '综艺']],
   movie: [['now', '正在上映'], ['upcoming', '即将上映'], ['hot', '热门']],
 };
 let discoverMedia = 'tv';
@@ -4168,7 +4320,8 @@ function renderCards(items, note) {
       card.appendChild(el('div', 'noposter', it.title));
     }
     const cap = el('div', 'cap');
-    cap.appendChild(el('b', null, it.title));
+    // 豆瓣按季上榜（「花儿与少年 第八季」），片名是 TMDB 的整部剧名，得把季补回来
+    cap.appendChild(el('b', null, it.title + (it.season > 1 ? ' 第' + it.season + '季' : '')));
     const meta = el('span', null, (it.year || ''));
     if (it.media_type === 'movie') meta.appendChild(el('span', 'kind', '影'));
     if (it.rating) meta.appendChild(el('span', 'star', '　★' + it.rating));
@@ -4180,7 +4333,7 @@ function renderCards(items, note) {
                  : '点击按季/集查看，右键一键找全季');
     // 电影和剧集都进详情页：电影就是只有一行的「季」，转存/播放/进度全都一样。
     // 右键仍然是「别问了直接找一份存下来」的快捷方式。
-    card.onclick = () => openSeries(it);
+    card.onclick = () => openSeries(it, it.season);
     card.oncontextmenu = (e) => { e.preventDefault(); startAuto(it); };
     box.appendChild(card);
   });

@@ -62,7 +62,9 @@ class MainActivity : ComponentActivity() {
                     is Screen.Home -> HomeScreen(
                         api = api,
                         settings = settings,
-                        onOpen = { push(Screen.Detail(it.tmdbId, it.mediaType, it.title)) },
+                        onOpen = {
+                            push(Screen.Detail(it.tmdbId, it.mediaType, it.title, season = it.season))
+                        },
                         onOpenLib = { l ->
                             push(Screen.Detail(l.tmdbId, l.mediaType, l.title,
                                 season = l.watchedSeason ?: l.season))

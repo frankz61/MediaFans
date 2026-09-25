@@ -300,11 +300,13 @@ private fun Field(
 
 private data class Rail(val title: String, val kind: String)
 
+// 华语段来自豆瓣、外语段来自 TMDB（服务端拼好）。豆瓣没有排期数据，
+// 所以不再有「今日播出 / 一周在播」，换成口碑榜和综艺——TMDB 在华语综艺上几乎是空白
 private val RAILS = listOf(
-    Rail("剧集 · 今日播出", "airing"),
-    Rail("剧集 · 一周在播", "onair"),
-    Rail("电影 · 正在上映", "now"),
     Rail("剧集 · 热门", "popular"),
+    Rail("电影 · 正在上映", "now"),
+    Rail("剧集 · 口碑", "praise"),
+    Rail("综艺", "variety"),
     Rail("电影 · 热门", "hot"),
 )
 
@@ -442,8 +444,8 @@ private fun PosterCard(item: MediaItem, onOpen: (MediaItem) -> Unit) {
             )
         }
         Spacer(Modifier.height(6.dp))
-        Text(item.title, color = T.Text, fontSize = 14.sp, maxLines = 1,
-            overflow = TextOverflow.Ellipsis)
+        Text(item.title + (item.season?.takeIf { it > 1 }?.let { " 第${it}季" } ?: ""),
+            color = T.Text, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         Sub(buildString {
             append(item.year)
             if (item.mediaType == "movie") append("　影")

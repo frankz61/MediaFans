@@ -3,7 +3,9 @@
 import json
 import re
 import threading
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import httpx
 import pytest
@@ -1220,11 +1222,25 @@ def _movie_webapp(upstream_url):
                               original_language="zh", media_type="movie", year="2019",
                               rating=7.9, tmdb_id=300, poster="https://img/p.jpg")]
 
+        def search(self, query, media_type="multi", prefer_chinese=True):
+            return [i for i in self.chinese_movie() if i.title == query]
+
         def now_playing(self, page=1):
             return [MediaItem(title="Dune", original_language="en",
                               media_type="movie", year="2021", tmdb_id=438631)]
 
+    class FakeDouban:
+        # 华语段来自豆瓣，再按片名对回 TMDB
+        def collection(self, name, count=50):
+            from mediafans.metadata.douban import DoubanItem
+
+            return [DoubanItem("1", "流浪地球", "movie", "2019", 7.9, ["中国大陆"])]
+
     app._tmdb = FakeTmdb()
+    app._douban = FakeDouban()
+    # 豆瓣对号结果会落盘，别写进真实的 ~/.mediafans
+    app._douban_map_path = Path(tempfile.mkdtemp()) / "douban_tmdb.json"
+    app._douban_map = {}
     app.tmdb_key = "x"
     return app
 
@@ -1272,7 +1288,7 @@ def test_discover_has_movie_lists(upstream_url):
 def test_unknown_discover_kind_falls_back_to_tv(upstream_url):
     """乱传 kind 不该 500——回到默认那一档就行."""
     app = _movie_webapp(upstream_url)
-    assert app.DISCOVER["airing"][2] == "tv"
+    assert app.DISCOVER["airing"][0] == "tv"
     assert app.DISCOVER.get("乱来") is None
 
 
@@ -1296,7 +1312,7 @@ def test_page_can_switch_between_tv_and_movie_lists():
     assert "setDiscoverMedia" in PAGE_HTML and 'data-media="movie"' in PAGE_HTML
     assert "正在上映" in PAGE_HTML and "即将上映" in PAGE_HTML
     # 电影卡片也进详情页，不再只有「自动找片」一条路
-    assert "card.onclick = () => openSeries(it);" in PAGE_HTML
+    assert "card.onclick = () => openSeries(it, it.season);" in PAGE_HTML
     # 详情页对电影换措辞。文案只有 scanLabel() 一个出处——
     # 以前 renderEpisodes 和出错分支各写各的，电影页一报错按钮就改了名
     assert "'找资源' : '找缺失的集'" in _js_fn("scanLabel")
@@ -1466,16 +1482,16 @@ def test_discover_is_cached_for_a_while(upstream_url):
     """榜单一天变不了几次，而每次首屏都要为它打两趟 TMDB——是首屏最慢的一段。"""
     app = _movie_webapp(upstream_url)
     calls = {"n": 0}
-    real = app._tmdb.chinese_movie
+    real = app._douban.collection
 
-    def counting(kind="now"):
+    def counting(name, count=50):
         calls["n"] += 1
-        return real(kind)
+        return real(name, count)
 
-    app._tmdb.chinese_movie = counting
+    app._douban.collection = counting
     a = app.api_discover("now")
     b = app.api_discover("now")
-    assert calls["n"] == 1                     # 第二次没再打 TMDB
+    assert calls["n"] == 1                     # 第二次没再打豆瓣 / TMDB
     assert a["cached"] is False and b["cached"] is True
     assert [i["title"] for i in a["items"]] == [i["title"] for i in b["items"]]
     # 过了 TTL 就得重新拉
