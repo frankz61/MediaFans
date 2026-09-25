@@ -1862,7 +1862,7 @@ PAGE_HTML = r"""<!doctype html>
      后一个还可能把前一个的结果盖掉。顶部的细条告诉用户「在忙，别点了」。 */
   #loadbar { position:fixed; top:0; left:0; height:3px; width:0; background:var(--accent);
              z-index:99; opacity:0; transition:width .4s ease-out, opacity .2s; pointer-events:none; }
-  body.busy #loadbar { opacity:1; width:70%; }
+  body.busy #loadbar, body.bgbusy #loadbar { opacity:1; width:70%; }
   body.busy .card, body.busy #epList .pill, body.busy #navbar button,
   body.busy #sources .sbtn, body.busy #quality .qbtn, body.busy .wrow, body.busy #files .row
     { pointer-events:none; opacity:.55; }
@@ -2879,8 +2879,10 @@ async function saveUser(payload) {
 async function renderLibrary() {
   const box = $('#libList');
   const cached = cacheGet('library');
-  if (cached && cached.length) paintLibrary(cached);
-  busy(true);
+  const painted = !!(cached && cached.length);
+  if (painted) paintLibrary(cached);
+  const hold = painted ? bgBusy : busy;   // 画上了就只是后台刷新，别锁住卡片
+  hold(true);
   try {
     const d = await (await fetch('/api/library')).json();
     if (d.error) throw new Error(d.error);
@@ -2889,7 +2891,7 @@ async function renderLibrary() {
   } catch (e) {
     if (!cached) box.innerHTML = '<div class="empty">读取失败：' + e.message + '</div>';
   } finally {
-    busy(false);
+    hold(false);
   }
 }
 
@@ -3025,10 +3027,21 @@ function enter() {
 // ---------------- 防呆：忙碌态 ----------------
 // 有请求在飞时把会触发新请求的入口全部锁住（CSS 里 body.busy 那组），
 // 顶部一条细进度条提示。计数而不是布尔：两个不相干的请求可以同时在飞。
-let inflight = 0;
+let inflight = 0, bgflight = 0;
 function busy(on) {
   inflight = Math.max(0, inflight + (on ? 1 : -1));
   document.body.classList.toggle('busy', inflight > 0);
+}
+
+// 后台刷新：只亮顶部细条，不锁界面。
+//
+// 上面那把锁是为「用户刚点了一下，别让他再点」设计的。stale-while-revalidate
+// 的后台刷新完全不是这个场景：内容已经画在屏幕上了，这时候把卡片禁掉是最糟的
+// 组合——看得见、点不动，和坏掉没区别。榜单冷缓存时后台那趟要好几秒到十几秒，
+// 锁这么久等于这一屏废了。
+function bgBusy(on) {
+  bgflight = Math.max(0, bgflight + (on ? 1 : -1));
+  document.body.classList.toggle('bgbusy', bgflight > 0);
 }
 
 // 本地缓存：首屏先把上次的内容画出来，再去后台刷新（stale-while-revalidate）。
@@ -3098,8 +3111,13 @@ async function playFile(f) {
     hint.className = 'error';
     hint.textContent = '播放失败：' + e.message;
   } finally {
-    // 只有最后一次请求负责释放忙碌态；被更新的请求作废的那次不动它
-    if (seq === playSeq) { playInFlightPath = ''; busy(false); }
+    // busy 是计数器，每一次 busy(true) 都必须有自己的 busy(false)——
+    // 以前这里跟着 seq 一起被守卫掉了：连点两集，先发的那次回来时 seq 已经变了，
+    // 它那一笔永远不减，inflight 卡在 ≥1，body.busy 再也不摘。于是整页的卡片、
+    // 集号、导航、来源、清晰度全被 pointer-events:none 钉死，只能刷新页面。
+    // seq 守卫只该管它真正保护的状态（playInFlightPath），不该管计数。
+    if (seq === playSeq) playInFlightPath = '';
+    busy(false);
   }
 }
 
@@ -4110,9 +4128,12 @@ async function loadShows(kind) {
   const box = $('#shows');
   // 上次的先画上，用户立刻有东西看；后台刷新回来再覆盖
   const cached = cacheGet('discover_' + kind);
-  if (cached && cached.items && cached.items.length) renderCards(cached.items, cached.note);
+  // 画上了缓存就只是后台刷新，别锁界面——卡片得能点，用户等的就是点进去
+  const painted = !!(cached && cached.items && cached.items.length);
+  if (painted) renderCards(cached.items, cached.note);
   else box.innerHTML = '<div class="empty">加载中…</div>';
-  busy(true);
+  const hold = painted ? bgBusy : busy;
+  hold(true);
   try {
     const data = await (await fetch('/api/discover?kind=' + kind)).json();
     if (seq !== showsSeq) return;
@@ -4125,7 +4146,7 @@ async function loadShows(kind) {
     // 有缓存就留着缓存，别用一条错误把已经画好的榜单冲掉
     if (!cached) box.innerHTML = '<div class="empty">加载失败：' + e.message + '</div>';
   } finally {
-    if (seq === showsSeq) busy(false);
+    hold(false);
   }
 }
 
@@ -4363,7 +4384,7 @@ async function loadSeason(tmdbId, season, refresh, media) {
     reportError(e.message, curNd);
     $('#epList').innerHTML = '<div class="empty">读取失败：' + e.message + '</div>';
   } finally {
-    if (seq === seasonSeq) busy(false);
+    busy(false);          // 同上：计数器一进一出，不能跟着 seq 被守卫掉
   }
 }
 

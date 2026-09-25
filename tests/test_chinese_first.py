@@ -235,3 +235,98 @@ def test_tmdb_base_url_is_configurable():
     assert seen[1].startswith("https://api.themoviedb.org/3/trending/movie/week")
     # 海报永远走官方图片站
     assert TmdbClient.poster_url("/x.jpg").startswith("https://image.tmdb.org/")
+
+
+# ------------------------------------------------- 中转抖一下不该让作品页报错
+# 2026-09-24 20:42-22:11 线上实录：/api/series?tmdb_id=282326 连续 400，
+# 正文是「读取剧集信息失败: The read operation timed out」；同一时刻
+# /api/search/media 也 400。境外中转的 nginx 把 api.themoviedb.org 的 8 个
+# AAAA 记录塞进了 upstream 池，而那台机器只有 link-local 的 IPv6，
+# 撞上就一直没响应，直到这边 15 秒读超时。中转已按 IPv4 修好，
+# 但这条链路本来就长，客户端也得能扛一次抖动。
+
+
+def test_transient_failure_is_retried_once():
+    """超时重试一次：重试会让中转重新挑一个 upstream 地址，实测能救回来."""
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("The read operation timed out", request=request)
+        return httpx.Response(200, json={"results": [
+            {"id": 1, "name": "交锋", "original_language": "zh"}]})
+
+    c = TmdbClient("k", transport=httpx.MockTransport(handler))
+    got = c.popular_tv()
+    assert len(calls) == 2                      # 第一趟超时，第二趟拿到了
+    assert [i.title for i in got] == ["交锋"]
+
+
+def test_relay_5xx_is_retried_but_4xx_is_not():
+    """5xx 是中转在说「上游挂了」，值得再来一次；4xx 再问一次还是同一个答案."""
+    for status, want_calls in ((502, 2), (503, 2), (401, 1), (404, 1)):
+        calls = []
+
+        def handler(request, status=status):
+            calls.append(1)
+            return httpx.Response(status, json={"status_message": "no"})
+
+        c = TmdbClient("k", transport=httpx.MockTransport(handler))
+        with pytest.raises(httpx.HTTPStatusError):
+            c.tv_detail(282326)
+        assert len(calls) == want_calls, status
+
+
+def test_retry_gives_up_and_raises_the_real_error():
+    """两趟都不行就把原始异常抛出去——上层要靠它的文字写进报错提示."""
+    def handler(request):
+        raise httpx.ReadTimeout("The read operation timed out", request=request)
+
+    c = TmdbClient("k", transport=httpx.MockTransport(handler))
+    with pytest.raises(httpx.ReadTimeout, match="read operation timed out"):
+        c.season_detail(282326, 1)
+
+
+def test_detail_endpoints_all_go_through_the_retrying_fetch():
+    """四个入口以前各写一份请求样板，重试只加在一处就会漏。
+
+    这里盯的是「有没有漏」：任何一个端点绕过 _fetch，它的超时就不会被重试。
+    """
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        return httpx.Response(200, json={"results": [], "id": 1, "seasons": [],
+                                         "genres": [], "episodes": []})
+
+    c = TmdbClient("k", transport=httpx.MockTransport(handler))
+    fetched = []
+    real = c._fetch
+    c._fetch = lambda path, params=None: (fetched.append(path), real(path, params))[1]
+    c.search("交锋", "tv")
+    c.movie_detail(1089598)
+    c.tv_detail(282326)
+    c.season_detail(282326, 1)
+    assert fetched == ["/search/tv", "/movie/1089598", "/tv/282326", "/tv/282326/season/1"]
+    assert len(seen) == 4        # 都真的发出去了，没有谁只是记了个名字
+
+
+def test_retry_does_not_stretch_the_total_wait():
+    """timeout 是整个调用的预算，按趟数平分——加了重试，上层不该等更久。
+
+    作品页要连着打 tv_detail + season_detail 两趟；要是每趟都给满 15 秒、
+    再各重试一次，最坏要等一分钟，「读取中…」比原来还难看。
+    """
+    seen = []
+
+    def handler(request):
+        seen.append(request.extensions.get("timeout", {}))
+        return httpx.Response(200, json={"results": []})
+
+    c = TmdbClient("k", timeout=15.0, transport=httpx.MockTransport(handler))
+    c.trending("movie")
+    assert c.TRIES == 2
+    # 每趟 7.5 秒 × 2 趟 = 原来的 15 秒
+    assert seen[0]["read"] == pytest.approx(7.5)
+    assert c.TRIES * seen[0]["read"] == pytest.approx(15.0)

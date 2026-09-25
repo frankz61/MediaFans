@@ -889,9 +889,12 @@ mediafans user list
 （`config.example.yaml` 里有注释）。境外 nginx 上一段：
 
 ```nginx
-location /tmdb-<随机串>/ {
-    proxy_pass https://api.themoviedb.org/;
+location ~ ^/tmdb-<随机串>/(.*)$ {
+    resolver 1.1.1.1 9.9.9.9 valid=300s ipv6=off;   # 关键，见下
+    set $tmdb_host api.themoviedb.org;
+    proxy_pass https://$tmdb_host/$1$is_args$args;
     proxy_ssl_server_name on;
+    proxy_ssl_name api.themoviedb.org;
     proxy_set_header Host api.themoviedb.org;
 }
 ```
@@ -899,6 +902,35 @@ location /tmdb-<随机串>/ {
 秘密路径是为了别变成一个公开的 TMDB 代理；TMDB 自己还要 api_key，双保险。
 只有接口需要中转，海报不用——`poster_url` 永远指官方图片站。TMDB 请求都是小 JSON，
 绕一圈境外没什么开销（实测榜单命中缓存时零点几秒）。
+
+### 中转必须显式关掉 IPv6
+
+**别写成 `proxy_pass https://api.themoviedb.org/;`。** 主机名写死时 nginx 只在加载
+配置时解析一次，把 `api.themoviedb.org`（CloudFront）返回的 **8 个 AAAA 和 8 个 A
+全部**塞进 upstream 池。而这台境外机器只有 link-local 的 IPv6、没有出口
+（`ip -6 route show default` 是空的），于是约一半的请求开头就撞上
+`connect() ... failed (101: Network is unreachable)`，把重试预算烧光，国内那台
+干等到 15 秒读超时。
+
+表现非常有误导性：**剧集列表时好时坏，昨天点不开今天又正常了**。因为池子是轮询的，
+起手抽到 A 记录就一切正常。线上实录（2026-09-24 20:42–22:11 +0800）：
+
+```
+GET /api/series?tmdb_id=282326&season=1&nd=quark&media=tv  400   ← 兰香如故，连续 5 次
+GET /api/search/media?kw=兰香如故                            400
+```
+
+两个端点的 400 正文都是 `…失败: The read operation timed out`——**共同依赖只有 TMDB**，
+这是定位的关键。对上中转那头的日志，同样 9 次请求全是 499（收到了、没在 15 秒内回话；
+新加坡 nginx 记 UTC，正好差 8 小时）。这类错误 09/21–09/25 每天几十次，不是偶发。
+
+变量 `proxy_pass` 让它改成每次按 `resolver` 解析，`ipv6=off` 保证只拿 A 记录。
+改完实测：国内那台连打 20 次全部 200，最慢 3.7 秒，中转零 IPv6 错误。
+
+客户端也跟着加了一层：`TmdbClient._fetch` 对网络错误和 5xx **重试一次**
+（重试会让中转重新挑一个 upstream 地址）。4xx 不重试——401 是密钥不对、
+404 是没这部，再问一次还是同一个答案。以前四个端点各写一份请求样板，
+重试只加在一处必然会漏，所以先把它们并成了一个 `_fetch`。
 
 其它外部依赖（PanSou、AI 网关）本来就是走公网地址，从国内可达，不用动。
 

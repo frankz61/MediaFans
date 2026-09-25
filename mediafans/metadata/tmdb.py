@@ -32,7 +32,19 @@ class TmdbClient:
         # base_url 指到一个能出去的反代（比如境外那台 nginx 上的一个秘密路径）。
         self.base = (base_url or "").strip().rstrip("/") or self.BASE
 
-    def _get(self, path: str, params: dict) -> List[dict]:
+    # 一次调用总共试几趟。timeout 是**整个调用**的预算，按趟数平分——
+    # 这样加了重试也不会让上层等得更久，作品页的「读取中…」还是最多 15 秒。
+    TRIES = 2
+
+    def _fetch(self, path: str, params: Optional[dict] = None) -> dict:
+        """打一趟 TMDB，返回整个 body。网络错误和 5xx 重试一次。
+
+        国内那台到 TMDB 要经境外 nginx 中转，正常 1.5–3.7 秒，但偶尔整趟卡死：
+        中转的 upstream 池里混进过不可达的 IPv6 地址，撞上就一直没有响应，
+        直到这边读超时。一次超时就让作品页报「读取剧集信息失败」代价太大——
+        重试会让中转重新挑一个 upstream 地址，实测能救回来。
+        4xx 不重试：401 是密钥不对、404 是没这部，再问一次还是同一个答案。
+        """
         params = dict(params or {})
         params.setdefault("language", "zh-CN")
         headers = {}
@@ -40,11 +52,24 @@ class TmdbClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
         else:
             params.setdefault("api_key", self.api_key)
-        with httpx.Client(timeout=self.timeout, transport=self.transport) as c:
-            r = c.get(f"{self.base}{path}", params=params, headers=headers)
-            r.raise_for_status()
-            body = r.json()
-        return body.get("results") or []
+        per_try = self.timeout / self.TRIES
+        last: Optional[Exception] = None
+        for attempt in range(self.TRIES):
+            try:
+                with httpx.Client(timeout=per_try, transport=self.transport) as c:
+                    r = c.get(f"{self.base}{path}", params=params, headers=headers)
+                    r.raise_for_status()
+                    return r.json()
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code < 500:
+                    raise
+                last = e
+            except httpx.TransportError as e:   # 超时、连不上、连接被掐断
+                last = e
+        raise last
+
+    def _get(self, path: str, params: dict) -> List[dict]:
+        return self._fetch(path, params).get("results") or []
 
     IMG = "https://image.tmdb.org/t/p"
 
@@ -149,15 +174,7 @@ class TmdbClient:
         为了让「作品」这一层保持同构，判断「是不是同一部作品」的 identity 逻辑
         （片名 + 动画/真人）对电影一样要用。
         """
-        params, headers = {"language": "zh-CN"}, {}
-        if self.api_key.startswith("eyJ"):
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        else:
-            params["api_key"] = self.api_key
-        with httpx.Client(timeout=self.timeout, transport=self.transport) as c:
-            r = c.get(f"{self.base}/movie/{int(tmdb_id)}", params=params, headers=headers)
-            r.raise_for_status()
-            body = r.json()
+        body = self._fetch(f"/movie/{int(tmdb_id)}")
         genres = [int(g.get("id") or 0) for g in (body.get("genres") or [])]
         return {
             "tmdb_id": int(body.get("id") or 0),
@@ -198,17 +215,7 @@ class TmdbClient:
 
     def tv_detail(self, tmdb_id: int) -> dict:
         """拿剧集的季/集数——判断资源完不完整要用这个做基准."""
-        params = {}
-        headers = {}
-        if self.api_key.startswith("eyJ"):
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        else:
-            params["api_key"] = self.api_key
-        params["language"] = "zh-CN"
-        with httpx.Client(timeout=self.timeout, transport=self.transport) as c:
-            r = c.get(f"{self.base}/tv/{int(tmdb_id)}", params=params, headers=headers)
-            r.raise_for_status()
-            body = r.json()
+        body = self._fetch(f"/tv/{int(tmdb_id)}")
         seasons = [
             {"season": int(s.get("season_number") or 0),
              "episodes": int(s.get("episode_count") or 0),
@@ -233,16 +240,7 @@ class TmdbClient:
 
     def season_detail(self, tmdb_id: int, season: int) -> dict:
         """某一季的权威集列表——判断「缺哪几集」要以这个为准，不能靠文件名猜。"""
-        params, headers = {"language": "zh-CN"}, {}
-        if self.api_key.startswith("eyJ"):
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        else:
-            params["api_key"] = self.api_key
-        with httpx.Client(timeout=self.timeout, transport=self.transport) as c:
-            r = c.get(f"{self.base}/tv/{int(tmdb_id)}/season/{int(season)}",
-                      params=params, headers=headers)
-            r.raise_for_status()
-            body = r.json()
+        body = self._fetch(f"/tv/{int(tmdb_id)}/season/{int(season)}")
         return {
             "season": int(body.get("season_number") or season),
             "name": body.get("name") or "",

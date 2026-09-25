@@ -1525,6 +1525,47 @@ def test_page_guards_against_double_clicks_and_paints_cache_first():
     assert "cacheGet('recent')" in _js_fn("renderWatch")
 
 
+def test_busy_counter_is_always_released():
+    """busy 是计数器，每一次 busy(true) 都得有自己的 busy(false)。
+
+    以前 playFile / loadSeason 的释放跟着 seq 一起被守卫掉：连点两集，
+    先发的那次回来时 seq 已经变了，它那一笔永远不减 —— inflight 卡在 ≥1，
+    body.busy 再也不摘，整页的卡片、集号、导航、来源、清晰度全被
+    pointer-events:none 钉死，只能刷新页面。榜单换成豆瓣后单档 5–15 秒，
+    这个窗口变得很容易踩到。
+    """
+    for fn in ("playFile", "loadSeason", "renderLibrary", "loadShows"):
+        body = _js_fn(fn)
+        assert re.search(r"} finally \{", body), fn
+        tail = body[body.rindex("} finally {"):]
+        # 释放那一行不能再挂在 seq 判断上
+        assert not re.search(r"if \(seq === \w+Seq\)\s*(\{[^}]*)?busy\(false\)", tail), fn
+        assert re.search(r"\b(busy|hold)\(false\)", tail), fn
+    # seq 守卫本身要留着——它保护的是状态，不是计数
+    assert "if (seq === playSeq) playInFlightPath = '';" in _js_fn("playFile")
+
+
+def test_background_refresh_does_not_lock_the_ui():
+    """stale-while-revalidate 已经把内容画出来了，这时候锁住卡片是最糟的组合。
+
+    榜单的华语段要按片名逐条对回 TMDB，冷缓存下单档实测 5–15 秒；
+    锁这么久，用户看得见一屏海报却点不动，和坏掉没区别。
+    """
+    from mediafans.web import PAGE_HTML
+
+    # 两个计数器分开：busy 锁界面，refresh 只亮顶部细条
+    assert "let inflight = 0, bgflight = 0;" in PAGE_HTML
+    assert "function bgBusy(on)" in PAGE_HTML
+    assert "body.busy #loadbar, body.bgbusy #loadbar" in PAGE_HTML
+    # refreshing 不出现在那组禁用规则里，否则等于没分开
+    disable = re.search(r"body\.busy \.card[^}]*\{[^}]*\}", PAGE_HTML, re.S)
+    assert disable and "bgbusy" not in disable.group(0)
+    # 有缓存走 refresh，没缓存走 busy
+    for fn in ("loadShows", "renderLibrary"):
+        body = _js_fn(fn)
+        assert "painted ? bgBusy : busy" in body, fn
+
+
 def test_mobile_portrait_collapses_player_rows_so_episodes_are_reachable():
     """竖屏播放时视频下面那四排要 150px，375x812 上集列表只剩 146px（两行）。
 
