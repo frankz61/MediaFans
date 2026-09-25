@@ -81,6 +81,32 @@
 
 豆瓣是按季上榜的（「花儿与少年 第八季」），卡片上会补上季号，点进去直接落在那一季。
 
+## 首次打开不用打字：扫码登录（1.3）
+
+遥控器打一串网址再打用户名密码，是装机时最劝退的一步。1.3 起：
+
+- **服务器地址打包时写进去。** `local.properties` 里加一行
+  `mediafans.server=https://你的域名:端口/入口路径`（就是网页端地址栏那个），
+  或者编译时设环境变量 `MEDIAFANS_SERVER`（优先）。没写的话首次打开还是要填一次，
+  填过就记住，之后只显示不再让人改，除非点「改地址」。
+- **登录默认扫码。** 设置页直接显示二维码 = 网页端地址 + `#tv=<6 位码>`。
+  手机扫了打开网页端（手机上本来就登录着），弹出「让电视登录」，点允许，
+  电视几秒内自己进首页，**以手机上那个账号**登录。扫不了码的，网页端顶栏点
+  「电视登录」，输屏幕上的 6 位数字。
+- 账号密码、访问令牌收在按钮后面，给服务端还没升级（老服务端没有配对接口）时用。
+- 网盘不在设置页选了，首页上直接切换，默认夸克。
+
+服务端那边（`/api/tv/pair/*`）：6 位码谁看见都行，取令牌还要一个只有那台电视知道的
+secret，所以看到屏幕的人最多替别人「批准」，拿不走令牌。批准时给电视发的是**新**令牌，
+电视上退出登录只作废电视那一个，不连累手机。配对 5 分钟过期，电视上自动换新码。
+
+## 老盒子连不上 HTTPS（1.3）
+
+`CertPathValidatorException: Trust anchor for certification path not found`：
+服务器用的是 Let's Encrypt，ISRG 根要到 Android 7.1.1 才进系统证书库，
+电视盒子大量停在 6.0/7.0。APK 里打包了 Let's Encrypt 的四个根（`res/raw/isrg_root_*.pem`），
+和系统证书库一起信任：7.0+ 走 `network_security_config.xml`，6.0 由 `MediaFansApp` 手动装。
+
 ## 它不做什么
 
 - **不做网盘登录**。夸克/百度的扫码在网页端做，电视上扫码输码都难受。
@@ -93,6 +119,8 @@
 ```bash
 cd androidtv
 echo "sdk.dir=/你的/Android/Sdk" > local.properties   # Windows 用正斜杠
+# 可选：默认服务器地址，电视首次打开直接出登录二维码（见上面「扫码登录」）
+echo "mediafans.server=https://你的域名:端口/入口路径" >> local.properties
 ./gradlew :app:assembleDebug
 ```
 
@@ -107,7 +135,9 @@ echo "sdk.dir=/你的/Android/Sdk" > local.properties   # Windows 用正斜杠
 ```nginx
 # 放在反代 location / 之前，不进应用、不要令牌——
 # 装 app 的场景就是「还没有令牌」，挡在令牌后面等于装不了。
-# 包里不含任何凭据（服务器地址和令牌是用户自己在 app 里填的）。
+# 包里不含任何凭据。但打包了 mediafans.server 的话，服务器地址（含入口路径）
+# 在包里是明文——拿到这个 APK 的人就知道入口在哪。入口只是防扫描，不是认证，
+# 介意就别打包地址，让电视上填一次。
 location = /tv.apk {
     alias /var/www/mediafans/tv.apk;
     default_type application/vnd.android.package-archive;

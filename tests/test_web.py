@@ -1667,6 +1667,64 @@ def test_login_issues_a_token_that_authorizes_apis(upstream_url, tmp_path):
         app.stop()
 
 
+def test_tv_pairing_logs_the_tv_in_as_whoever_approved(upstream_url, tmp_path):
+    """电视扫码登录：电视拿码 → 手机上的已登录用户批准 → 电视取到**自己的**令牌."""
+    app = _auth_app(upstream_url, tmp_path, entry="s3cret")
+    base = f"http://127.0.0.1:{app.port}"
+    # 带 XFF 才算外部请求，不然本机免验会把电视当成管理员
+    outside = {"X-Forwarded-For": "203.0.113.9"}
+    try:
+        start = httpx.post(base + "/api/tv/pair/start", headers=outside,
+                           json={"page": "https://tv.example/s3cret"}, timeout=10).json()
+        code, secret = start["code"], start["secret"]
+        assert len(code) == 6 and code.isdigit()
+        assert start["url"] == f"https://tv.example/s3cret#tv={code}"
+        assert start["qr"] and len(start["qr"]) == len(start["qr"][0])
+
+        def poll(sec=secret):
+            return httpx.get(base + "/api/tv/pair/poll", headers=outside,
+                             params={"code": code, "secret": sec}, timeout=10).json()
+
+        assert poll()["status"] == "pending"
+        # 光知道屏幕上的码不够：没有 secret 取不走令牌
+        assert poll("guess")["status"] == "expired"
+        # 批准要登录
+        anon = httpx.post(base + "/api/tv/pair/approve", headers=outside,
+                          json={"code": code}, timeout=10)
+        assert anon.status_code == 401
+
+        kid = httpx.post(base + "/api/login", json={"username": "kid", "password": "hunter22"},
+                         timeout=10).json()["token"]
+        r = httpx.post(base + "/api/tv/pair/approve", headers=outside,
+                       cookies={"mf_token": kid}, json={"code": code}, timeout=10)
+        assert r.status_code == 200 and r.json()["user"] == "kid"
+
+        got = poll()
+        assert got["status"] == "ok" and got["user"] == "kid"
+        # 发的是新令牌，不是把手机那个交出去：电视退出不连累手机
+        assert got["token"] != kid
+        me = httpx.get(base + "/api/me", headers=outside,
+                       params={"token": got["token"]}, timeout=10).json()
+        assert me["user"]["name"] == "kid"
+        # 一次性
+        assert poll()["status"] == "expired"
+        again = httpx.post(base + "/api/tv/pair/approve", headers=outside,
+                           cookies={"mf_token": kid}, json={"code": code}, timeout=10)
+        assert again.status_code == 400
+    finally:
+        app.stop()
+
+
+def test_tv_pairing_without_a_usable_page_still_gives_a_code(upstream_url, tmp_path):
+    """电视上没填出像样的网页地址：不给二维码，数字码照样能在网页端手动输."""
+    app = _auth_app(upstream_url, tmp_path)
+    try:
+        d = app.api_tv_pair_start({"page": "javascript:alert(1)"})
+        assert d["qr"] == [] and d["url"] == "" and len(d["code"]) == 6
+    finally:
+        app.stop()
+
+
 def test_library_and_progress_do_not_leak_between_users(upstream_url, tmp_path):
     """资源共用、展示分开：两个人看同一个文件，片库和进度互不可见。"""
     app = _auth_app(upstream_url, tmp_path)

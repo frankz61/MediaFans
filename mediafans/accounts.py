@@ -240,11 +240,24 @@ class Accounts:
                 self._note_failure(ip)
                 return None
             self._fails.pop(ip, None)
-            token = secrets.token_urlsafe(32)
-            self._sessions[token] = (u.name, time.time() + SESSION_TTL)
-            self._prune_sessions()
-            self._flush()
-            return token
+            return self._issue(u.name)
+
+    def issue(self, name: str) -> Optional[str]:
+        """不验密码直接给这个用户发一个新令牌。
+
+        只给「已经验过身份的人替自己的另一台设备要令牌」用（电视扫码登录）：
+        调用方负责确认请求者就是 name 本人。
+        """
+        with self._lock:
+            u = self._load().get(name)
+            return self._issue(u.name) if u else None
+
+    def _issue(self, name: str) -> str:
+        token = secrets.token_urlsafe(32)
+        self._sessions[token] = (name, time.time() + SESSION_TTL)
+        self._prune_sessions()
+        self._flush()
+        return token
 
     def resolve(self, token: str) -> Optional[User]:
         """令牌 -> 用户。过期或不认识都返回 None。"""

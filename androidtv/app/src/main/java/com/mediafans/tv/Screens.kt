@@ -1,6 +1,10 @@
 package com.mediafans.tv
 
 import androidx.compose.foundation.background
+import kotlinx.coroutines.delay
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -99,136 +103,166 @@ fun TvButton(
 /**
  * 连接服务器 + 登录。
  *
- * 两种登录方式：
- * - **账号**（默认）：服务端开了多用户之后，家里每个人一个账号，片库和进度按人分。
- *   电视是全家共用的，但「继续观看」要的恰恰是**我**看到哪了。
- * - **访问令牌**：服务端 `--token` 那个共享令牌，视为管理员。升级前的电视都是这么连的，
- *   不能让它们升级完就连不上。
+ * 电视上用遥控器打字是最大的痛点，所以这一页尽量**什么都不用打**：
+ * - **服务器地址**打包时就写进去了（local.properties 的 mediafans.server），
+ *   没写的才要填一次；填过就记住，只显示不再让人改，除非点「改服务器地址」。
+ * - **登录默认扫码**：电视显示二维码，手机扫了打开网页端（手机上本来就登录着），
+ *   点「允许」，电视自己进去。扫不了码的，在网页端「电视登录」里输屏幕上的 6 位数字。
+ * - 账号密码、访问令牌收在按钮后面，给扫码走不通的时候（比如服务端还没升级）。
+ * - 网盘不在这里选：首页上直接切换，默认夸克。
  *
  * 保存前先真的连一次：地址填错、入口路径抄进来、密码不对，都在这一页当场说清楚，
  * 而不是进了首页才是一屏莫名其妙的报错。
  */
 @Composable
 fun SetupScreen(api: Api, settings: Settings, notice: String, onDone: () -> Unit) {
-    var base by remember { mutableStateOf(settings.base) }
-    // 已经存着令牌、又不是真账号的（共享令牌，或老版本升级上来的）：默认停在令牌方式
-    var byToken by remember {
-        mutableStateOf(settings.token.isNotEmpty() && !settings.hasAccount)
+    // 确认过的网页端地址（带入口路径）。空 = 还得先填地址
+    var page by remember { mutableStateOf(settings.page) }
+    var editingAddr by remember { mutableStateOf(page.isEmpty()) }
+    var addrInput by remember { mutableStateOf(page) }
+    // qr / account / token。已经存着共享令牌的（老版本升级上来的）默认停在令牌方式
+    var mode by remember {
+        mutableStateOf(if (settings.token.isNotEmpty() && !settings.hasAccount) "token" else "qr")
     }
     var username by remember {
         mutableStateOf(if (settings.hasAccount) settings.user else "")
     }
     var password by remember { mutableStateOf("") }
-    var token by remember { mutableStateOf(if (byToken) settings.token else "") }
-    var nd by remember { mutableStateOf(settings.netdisk) }
+    var token by remember { mutableStateOf(if (mode == "token") settings.token else "") }
     var msg by remember { mutableStateOf(notice) }
     var busy by remember { mutableStateOf(false) }
+    var pairing by remember { mutableStateOf<Pairing?>(null) }
+    var qrMsg by remember { mutableStateOf("") }
+    var qrRetry by remember { mutableStateOf(0) }
     val scope = rememberCoroutineScope()
     val first = remember { FocusRequester() }
-    LaunchedEffect(Unit) { runCatching { first.requestFocus() } }
+    LaunchedEffect(editingAddr, mode) { runCatching { first.requestFocus() } }
 
     val loggedIn = settings.token.isNotEmpty()
 
+    /** 拿到令牌之后统一走这里：存下来，验一次是谁，进首页。 */
+    suspend fun finish(real: String, newToken: String, user: String?) {
+        val old = Triple(settings.base, settings.token, settings.user)
+        runCatching {
+            withContext(Dispatchers.IO) {
+                settings.base = real
+                settings.token = newToken
+                // 顺带验一次：令牌填错在这里就会 401，而不是进了首页才报
+                settings.user = user?.takeIf { it.isNotEmpty() } ?: api.me().name
+            }
+        }.onSuccess {
+            settings.page = page
+            busy = false
+            onDone()
+        }.onFailure {
+            // 没连上就别动原来那套：可能只是这次手滑，旧的还能用
+            settings.base = old.first
+            settings.token = old.second
+            settings.user = old.third
+            busy = false
+            msg = (it as? ApiError)?.takeIf { e -> e.needLogin && mode == "token" }
+                ?.let { "访问令牌不对" } ?: (it.message ?: "连接失败")
+        }
+    }
+
+    // 扫码：地址定了就一直挂着一个有效的二维码。过期自动换新的，批准了就进去。
+    // 离开这一页（或者切到别的登录方式）协程跟着取消，不会在后台空轮询。
+    LaunchedEffect(page, editingAddr, mode, qrRetry) {
+        pairing = null
+        qrMsg = ""
+        if (editingAddr || mode != "qr" || page.isEmpty()) return@LaunchedEffect
+        val real = try {
+            withContext(Dispatchers.IO) { api.resolveBase(splitAddress(page).first) }
+        } catch (e: Exception) {
+            qrMsg = e.message ?: "连不上服务器"
+            return@LaunchedEffect
+        }
+        while (true) {
+            val p = try {
+                withContext(Dispatchers.IO) { api.pairStart(real, page) }
+            } catch (e: Exception) {
+                qrMsg = e.message ?: "生成二维码失败"
+                return@LaunchedEffect
+            }
+            pairing = p
+            qrMsg = ""
+            var failures = 0
+            while (true) {
+                delay(2000)
+                val st = try {
+                    withContext(Dispatchers.IO) { api.pairPoll(real, p) }
+                } catch (e: Exception) {
+                    // 网络抖一下别急着报错，连着几次都不通再说
+                    if (++failures >= 5) qrMsg = "和服务器断了：${e.message ?: ""}"
+                    continue
+                }
+                failures = 0
+                qrMsg = ""
+                if (st.status == "ok") {
+                    busy = true
+                    msg = "手机上已允许，正在进入…"
+                    finish(real, st.token, st.user)
+                    return@LaunchedEffect
+                }
+                if (st.status != "pending") break      // 过期了：换一个新码
+            }
+        }
+    }
+
     val connect: () -> Unit = connect@{
         if (busy) return@connect
-        val (addr, tokInAddr) = splitAddress(base)
-        if (addr.isEmpty()) { msg = "先填服务器地址"; return@connect }
-        // 地址栏里带着 token=：直接当令牌登录，省得再抄一遍
-        val useToken = byToken || (tokInAddr.isNotEmpty() && username.isBlank())
-        val tok = token.trim().ifEmpty { tokInAddr }
-        if (useToken && tok.isEmpty()) { msg = "填访问令牌，或者换成账号登录"; return@connect }
+        val useToken = mode == "token"
+        if (useToken && token.isBlank()) { msg = "填访问令牌，或者换成扫码登录"; return@connect }
         if (!useToken && (username.isBlank() || password.isEmpty())) {
             msg = "填用户名和密码"; return@connect
         }
         busy = true
         msg = "连接中…"
-        val old = Triple(settings.base, settings.token, settings.user)
         scope.launch {
-            runCatching {
-                withContext(Dispatchers.IO) {
-                    val real = api.resolveBase(addr)
-                    val newToken = if (useToken) tok
-                                   else api.login(real, username.trim(), password)
-                    settings.base = real
-                    settings.token = newToken
-                    // 顺带验一次：令牌填错在这里就会 401，而不是进了首页才报
-                    settings.user = api.me().name
-                }
-            }.onSuccess {
-                settings.netdisk = nd
-                busy = false
-                onDone()
-            }.onFailure {
-                // 没连上就别动原来那套：可能只是这次手滑，旧的还能用
-                settings.base = old.first
-                settings.token = old.second
-                settings.user = old.third
-                busy = false
-                msg = (it as? ApiError)?.takeIf { e -> e.needLogin && useToken }
-                    ?.let { "访问令牌不对" } ?: (it.message ?: "连接失败")
+            val real = try {
+                withContext(Dispatchers.IO) { api.resolveBase(splitAddress(page).first) }
+            } catch (e: Exception) {
+                busy = false; msg = e.message ?: "连接失败"; return@launch
             }
+            val newToken = if (useToken) token.trim() else try {
+                withContext(Dispatchers.IO) { api.login(real, username.trim(), password) }
+            } catch (e: Exception) {
+                busy = false; msg = e.message ?: "登录失败"; return@launch
+            }
+            finish(real, newToken, null)
         }
     }
 
-    // 这一页在手机上会被输入法吃掉大半高度（横屏尤其惨），所以：
-    // 能滚 + 顶对齐 + imePadding。原来是垂直居中且不可滚，输入法一弹，
-    // 「保存并进入」直接被顶到屏幕外，看起来就像没有确认按钮。
-    Column(
-        Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .imePadding()
-            .padding(OVERSCAN),
-    ) {
-        Title("连接到 MediaFans 服务", 26)
-        Spacer(Modifier.height(4.dp))
-        Sub("填网页端那台服务的地址，用你的账号登录。填一次就够了。")
-        if (loggedIn) {
-            Spacer(Modifier.height(4.dp))
-            Sub("当前：" + (if (settings.hasAccount) settings.user else "访问令牌（管理员）") +
-                "　@ " + settings.base, 14, T.Accent)
+    // 填好地址点「下一步」。地址栏里带着 token= 的：直接当令牌登录，省得再抄一遍
+    val confirmAddr: () -> Unit = confirm@{
+        val (addr, tokInAddr) = splitAddress(addrInput)
+        if (addr.isEmpty()) { msg = "先填服务器地址"; return@confirm }
+        page = addr
+        editingAddr = false
+        msg = ""
+        if (tokInAddr.isNotEmpty()) {
+            mode = "token"
+            token = tokInAddr
+            connect()
         }
-        if (msg.isNotEmpty()) {
-            Spacer(Modifier.height(8.dp))
-            Sub(msg, 15, if (busy) T.Dim else T.Warn)
-        }
-        Spacer(Modifier.height(16.dp))
+    }
 
-        Field("服务器地址（网页端地址栏整个抄过来也行）", base,
-              "https://example.com:12583", first, imeAction = ImeAction.Next) { base = it }
-        Spacer(Modifier.height(12.dp))
-
-        Row(verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Sub("登录方式", 16, T.Text)
-            TvButton(if (!byToken) "● 账号" else "○ 账号") { byToken = false }
-            TvButton(if (byToken) "● 访问令牌" else "○ 访问令牌") { byToken = true }
-        }
-        Spacer(Modifier.height(12.dp))
-
-        if (byToken) {
-            // 令牌这一栏的键盘上给「完成」：手机横屏时按钮多半在屏幕外，
-            // 键盘上那个对勾才是最先够得着的确认入口
-            Field("访问令牌", token, "服务端 --token 那一串（管理员，没有个人片库）",
-                  imeAction = ImeAction.Done, onDone = connect) { token = it }
-        } else {
-            Field("用户名", username, "管理员在网页端「用户」里给你开的账号",
-                  imeAction = ImeAction.Next) { username = it }
-            Spacer(Modifier.height(12.dp))
-            Field("密码", password, "", password = true,
-                  imeAction = ImeAction.Done, onDone = connect) { password = it }
-        }
-        Spacer(Modifier.height(16.dp))
-
-        Row(verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            Sub("网盘", 16, T.Text)
-            TvButton(if (nd == "quark") "● 夸克" else "○ 夸克") { nd = "quark" }
-            TvButton(if (nd == "baidu") "● 百度" else "○ 百度") { nd = "baidu" }
-        }
-        Spacer(Modifier.height(16.dp))
+    // 其他方式都收在这一行。扫码时放在说明文字下面（电视可用高度只有 ~430dp，
+    // 摞在二维码下面就得滚动），焦点默认落在第一个按钮上——扫码本身不用碰遥控器
+    val others: @Composable () -> Unit = {
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            TvButton(if (busy) "连接中…" else "登录并进入", onClick = connect)
+            if (mode != "qr") {
+                TvButton("扫码登录") { msg = ""; mode = "qr" }
+            }
+            if (mode != "account") {
+                TvButton("账号密码", focusRequester = if (mode == "qr") first else null) {
+                    msg = ""; mode = "account"
+                }
+            }
+            if (mode != "token") {
+                TvButton("访问令牌") { msg = ""; mode = "token" }
+            }
+            TvButton("改地址") { addrInput = page; msg = ""; editingAddr = true }
             if (loggedIn) {
                 TvButton("退出登录") {
                     if (!busy) {
@@ -246,7 +280,127 @@ fun SetupScreen(api: Api, settings: Settings, notice: String, onDone: () -> Unit
                 }
             }
         }
-        Spacer(Modifier.height(24.dp))
+    }
+
+    // 这一页在手机上会被输入法吃掉大半高度（横屏尤其惨），所以：
+    // 能滚 + 顶对齐 + imePadding。原来是垂直居中且不可滚，输入法一弹，
+    // 「保存并进入」直接被顶到屏幕外，看起来就像没有确认按钮。
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .imePadding()
+            .padding(OVERSCAN),
+    ) {
+        Title("连接到 MediaFans 服务", 26)
+        if (loggedIn) {
+            Spacer(Modifier.height(4.dp))
+            Sub("当前：" + (if (settings.hasAccount) settings.user else "访问令牌（管理员）") +
+                "　@ " + settings.base, 14, T.Accent)
+        }
+        if (msg.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Sub(msg, 15, if (busy) T.Dim else T.Warn)
+        }
+        Spacer(Modifier.height(16.dp))
+
+        if (editingAddr) {
+            Sub("填一次就记住了。网页端地址栏整个抄过来就行。", 15)
+            Spacer(Modifier.height(12.dp))
+            Field("服务器地址", addrInput, "https://example.com:12583/入口",
+                  first, imeAction = ImeAction.Done, onDone = confirmAddr) { addrInput = it }
+            Spacer(Modifier.height(16.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                TvButton("下一步", onClick = confirmAddr)
+                if (page.isNotEmpty()) {
+                    TvButton("取消") { addrInput = page; msg = ""; editingAddr = false }
+                }
+            }
+            return@Column
+        }
+
+        Sub("服务器：$page", 14)
+        Spacer(Modifier.height(12.dp))
+
+        when (mode) {
+            "qr" -> Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(
+                    Modifier.size(220.dp).clip(RoundedCornerShape(10.dp)).background(Color.White),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    val p = pairing
+                    if (p != null && p.qr.isNotEmpty()) {
+                        QrCode(p.qr, Modifier.padding(14.dp).fillMaxSize())
+                    } else {
+                        Text(if (p != null) "没有二维码\n输右边的数字" else "…",
+                             color = Color.Gray, fontSize = 16.sp)
+                    }
+                }
+                Spacer(Modifier.width(32.dp))
+                Column {
+                    Title("用手机扫码登录", 22)
+                    Spacer(Modifier.height(8.dp))
+                    Sub("1. 手机扫左边的二维码，打开网页端", 16, T.Text)
+                    Spacer(Modifier.height(4.dp))
+                    Sub("2. 在网页上点「允许这台电视登录」", 16, T.Text)
+                    Spacer(Modifier.height(4.dp))
+                    Sub("电视会以手机上那个账号登录，片库和进度都是你的。", 14)
+                    Spacer(Modifier.height(10.dp))
+                    pairing?.let {
+                        Sub("扫不了？在网页端点「电视登录」，输入", 14)
+                        Text(it.code.chunked(3).joinToString(" "), color = T.Accent,
+                             fontSize = 34.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                    if (pairing == null && qrMsg.isEmpty()) Sub("正在生成二维码…", 15)
+                    if (qrMsg.isNotEmpty()) {
+                        Spacer(Modifier.height(6.dp))
+                        Sub(qrMsg, 15, T.Warn)
+                        Spacer(Modifier.height(6.dp))
+                        TvButton("重试") { qrRetry++ }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                    others()
+                }
+            }
+            "token" -> {
+                // 令牌这一栏的键盘上给「完成」：手机横屏时按钮多半在屏幕外，
+                // 键盘上那个对勾才是最先够得着的确认入口
+                Field("访问令牌", token, "服务端 --token 那一串（管理员，没有个人片库）",
+                      first, imeAction = ImeAction.Done, onDone = connect) { token = it }
+                Spacer(Modifier.height(16.dp))
+                TvButton(if (busy) "连接中…" else "登录并进入", onClick = connect)
+            }
+            else -> {
+                Field("用户名", username, "管理员在网页端「用户」里给你开的账号",
+                      first, imeAction = ImeAction.Next) { username = it }
+                Spacer(Modifier.height(12.dp))
+                Field("密码", password, "", password = true,
+                      imeAction = ImeAction.Done, onDone = connect) { password = it }
+                Spacer(Modifier.height(16.dp))
+                TvButton(if (busy) "连接中…" else "登录并进入", onClick = connect)
+            }
+        }
+        if (mode != "qr") {
+            Spacer(Modifier.height(24.dp))
+            others()
+        }
+    }
+}
+
+/** 服务端算好的二维码点阵，一行一个字符串，'1' 是黑块。白底和留白由外面的 Box 给。 */
+@Composable
+private fun QrCode(rows: List<String>, modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val cell = minOf(size.width, size.height) / rows.size
+        rows.forEachIndexed { y, row ->
+            row.forEachIndexed { x, c ->
+                if (c == '1') {
+                    // 多画半个像素，免得相邻黑块之间漏出发丝一样的白缝
+                    drawRect(Color.Black, topLeft = Offset(x * cell, y * cell),
+                             size = Size(cell + 0.5f, cell + 0.5f))
+                }
+            }
+        }
     }
 }
 

@@ -83,6 +83,71 @@ class _LoginSessions:
         return self._items.get(sid)
 
 
+class _TvPairs:
+    """电视扫码登录的配对（内存态，服务重启即失效）。
+
+    电视上用遥控器打用户名密码太折磨，于是反过来：电视要一个短码并显示成二维码，
+    手机扫码打开网页端（手机上本来就登录着），点「允许」，服务端替这个用户
+    发一个新令牌挂到配对上，电视轮询取走。
+
+    两个值分开：**code** 是 6 位数字，显示在屏幕上、印在二维码里，谁看见都行；
+    **secret** 只有发起配对的那台电视知道，取令牌必须带它。看到电视屏幕的人
+    （或者猜中 code 的人）能做的最多是替别人批准，拿不走令牌。
+    """
+
+    TTL = 300.0
+
+    def __init__(self, cap: int = 64):
+        self._cap = cap
+        self._lock = threading.Lock()
+        self._items: "OrderedDict[str, dict]" = OrderedDict()
+
+    def _prune(self) -> None:
+        now = time.time()
+        for code in [c for c, p in self._items.items() if p["expires"] <= now]:
+            del self._items[code]
+
+    def start(self) -> dict:
+        import secrets
+
+        with self._lock:
+            self._prune()
+            code = f"{secrets.randbelow(10 ** 6):06d}"
+            while code in self._items:
+                code = f"{secrets.randbelow(10 ** 6):06d}"
+            pair = {"code": code, "secret": secrets.token_urlsafe(24),
+                    "expires": time.time() + self.TTL, "token": "", "user": ""}
+            self._items[code] = pair
+            # 有上限：这个端点不要求登录，不能让人刷爆内存。挤掉的是最老的
+            while len(self._items) > self._cap:
+                self._items.popitem(last=False)
+            return dict(pair)
+
+    def approve(self, code: str, token: str, user: str) -> bool:
+        with self._lock:
+            self._prune()
+            p = self._items.get(code)
+            if not p or p["token"]:
+                return False
+            p["token"], p["user"] = token, user
+            return True
+
+    def poll(self, code: str, secret: str) -> dict:
+        """pending / ok（带令牌，同时销毁配对）/ expired（没有这个配对或 secret 不对）。"""
+        import hmac
+
+        with self._lock:
+            self._prune()
+            p = self._items.get(code)
+            if not p or not hmac.compare_digest(p["secret"], secret or ""):
+                return {"status": "expired"}
+            if not p["token"]:
+                return {"status": "pending",
+                        "expires_in": max(0, int(p["expires"] - time.time()))}
+            del self._items[code]   # 一次性：令牌只交出去一次
+            return {"status": "ok", "token": p["token"], "user": p["user"]}
+
+
 class _AutoJobs:
     """一键找片是个跑几十秒的活儿，扔后台线程里跑，前端轮询进度。
 
@@ -174,6 +239,7 @@ class WebApp:
         # 字幕令牌另开一份：字幕是 <track src> 取的，跟播放直链各管各的生命周期
         self.subs_registry = _PlayRegistry(cap=60)
         self.logins = _LoginSessions()
+        self.tv_pairs = _TvPairs()
         self.jobs = _AutoJobs()
         self._tmdb = None
         self._douban = None
@@ -879,6 +945,59 @@ class WebApp:
             raise MediaFansError("未登录")
         return {"user": u.as_public()}
 
+    # ---------------------------------------------------------------- 电视扫码登录
+    def api_tv_pair_start(self, payload: dict) -> dict:
+        """电视发起配对。**不要求登录**——电视这时候还什么都没有。
+
+        page 是电视上填的网页端地址（带入口路径的那个）。二维码就是它加
+        `#tv=<code>`：手机扫了直接打开网页端并弹出「允许」。二维码的点阵在这边
+        算好发过去，电视端就不用为画个二维码再引一个库。page 不像个网址就不给
+        点阵，电视只显示数字码，让人在网页端手动输。
+        """
+        pair = self.tv_pairs.start()
+        page = str(payload.get("page") or "").strip()
+        out = {"code": pair["code"], "secret": pair["secret"],
+               "expires_in": int(_TvPairs.TTL), "url": "", "qr": []}
+        if page.startswith(("http://", "https://")) and len(page) <= 300:
+            import qrcode
+
+            url = page.split("#")[0] + "#tv=" + pair["code"]
+            qr = qrcode.QRCode(border=0, error_correction=qrcode.constants.ERROR_CORRECT_M)
+            qr.add_data(url)
+            qr.make(fit=True)
+            out["url"] = url
+            out["qr"] = ["".join("1" if c else "0" for c in row) for row in qr.get_matrix()]
+        return out
+
+    def api_tv_pair_poll(self, code: str, secret: str) -> dict:
+        return self.tv_pairs.poll(code, secret)
+
+    def api_tv_pair_approve(self, payload: dict) -> dict:
+        """网页端点「允许」：替当前用户发一个新令牌给那台电视。
+
+        发的是新令牌而不是把自己这个给出去：电视上「退出登录」只作废电视那一个，
+        手机不受牵连。
+        """
+        u = self.current_user()
+        if not u:
+            raise MediaFansError("未登录")
+        code = "".join(ch for ch in str(payload.get("code") or "") if ch.isdigit())
+        if u is self.master_user():
+            # 共享令牌 / 本机免验的内建管理员不在账号表里，发不了会话令牌。
+            # 有 --token 就把它交给电视（跟在电视上手输令牌等价）；没有就真的没东西可给
+            if not self.token:
+                raise MediaFansError("当前是本机免验身份，没有令牌可以给电视。用账号登录网页端再批准")
+            token, name = self.token, u.name
+        else:
+            token, name = self.accounts.issue(u.name), u.name
+            if not token:
+                raise MediaFansError("账号不存在")
+        if not self.tv_pairs.approve(code, token, name):
+            if u is not self.master_user():
+                self.accounts.logout(token)   # 没配上就别留一个没人用的令牌
+            raise MediaFansError("电视上的码不对或已过期，在电视上刷新一下再扫")
+        return {"ok": True, "user": name}
+
     # ---------------------------------------------------------------- 片库
     def api_library(self) -> dict:
         """当前用户的片库。
@@ -1501,10 +1620,20 @@ class WebApp:
                     except Exception as e:
                         self._json(500, {"error": str(e)})
                     return
+                if parsed.path == "/api/tv/pair/start":
+                    # 电视这时候还没有令牌，只能不验
+                    try:
+                        self._json(200, app.api_tv_pair_start(self._body()))
+                    except MediaFansError as e:
+                        self._json(400, {"error": str(e)})
+                    return
                 if not ok:
                     self._deny()
                     return
                 try:
+                    if parsed.path == "/api/tv/pair/approve":
+                        self._json(200, app.api_tv_pair_approve(self._body()))
+                        return
                     if parsed.path == "/api/logout":
                         self._json(200, app.api_logout(self._bearer(query)))
                         return
@@ -1678,6 +1807,11 @@ class WebApp:
                 query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 page = parsed.path in ("/", "/index.html") or self._is_entry(parsed.path)
                 ok = self._authorized(query)
+                if parsed.path == "/api/tv/pair/poll":
+                    # 电视等批准时还没有令牌；凭的是发起配对时拿到的 secret
+                    self._json(200, app.api_tv_pair_poll(query.get("code", ""),
+                                                         query.get("secret", "")))
+                    return
                 # 页面本身**不要求登录**——它自己会画登录框。但只在入口路径上给，
                 # 其余一律 404。要求登录再给页面反而更容易被扫：401 也是一种回应。
                 if not ok and not page:
@@ -1983,6 +2117,17 @@ PAGE_HTML = r"""<!doctype html>
   .modal { position:fixed; inset:0; background:rgba(0,0,0,.72); z-index:120;
            display:none; align-items:center; justify-content:center; padding:16px; }
   .modal.on { display:flex; }
+  /* 电视扫码登录：手机上就这一个框，按钮做大 */
+  #tvPair .panel { width:380px; }
+  #tvPair .body { padding:16px 14px; display:flex; flex-direction:column; gap:12px; }
+  #tvPair .body .dim { font-size:13px; line-height:1.6; }
+  #tvPair .body input { background:var(--bg); border:1px solid var(--line); color:var(--text);
+                  border-radius:8px; padding:12px; font-size:22px; letter-spacing:6px;
+                  text-align:center; }
+  #tvPair .body button { background:var(--accent); color:#fff; border:none; border-radius:8px;
+                   padding:13px; font-size:16px; }
+  #tvPair .err { color:#ff7a7a; font-size:13px; min-height:16px; }
+  #tvPair .err.ok { color:var(--accent); }
   .modal .panel { background:var(--panel); border:1px solid var(--line);
                   border-radius:10px; width:560px; max-width:100%; max-height:86vh;
                   display:flex; flex-direction:column; }
@@ -2172,9 +2317,9 @@ PAGE_HTML = r"""<!doctype html>
   #usersBtn { background:#222836; border:1px solid var(--line); color:var(--dim);
               border-radius:6px; padding:6px 10px; font-size:12px; }
   #usersBtn:hover { color:var(--text); }
-  #loginBtn, #outBtn { background:#222836; border:1px solid var(--line); color:var(--dim);
+  #tvBtn, #loginBtn, #outBtn { background:#222836; border:1px solid var(--line); color:var(--dim);
                        flex:none; border-radius:6px; padding:6px 10px; font-size:12px; }
-  #loginBtn:hover, #outBtn:hover { color:var(--text); }
+  #tvBtn:hover, #loginBtn:hover, #outBtn:hover { color:var(--text); }
   #driveSel { background:#222836; border:1px solid var(--line); color:var(--dim);
               flex:none; border-radius:6px; padding:5px 6px; font:inherit; }
   #driveSel:hover { color:var(--text); }
@@ -2334,6 +2479,19 @@ PAGE_HTML = r"""<!doctype html>
   </div>
   <div class="err" id="uErr"></div>
 </div></div>
+<div id="tvPair" class="modal"><div class="panel">
+  <div class="head">
+    <b>让电视登录</b>
+    <button class="linkbtn" onclick="closeTvPair()">关闭</button>
+  </div>
+  <div class="body">
+    <div class="dim" id="tvWho"></div>
+    <input id="tvCode" inputmode="numeric" maxlength="7" placeholder="电视上显示的 6 位数字"
+           autocomplete="off" onkeydown="if(event.key==='Enter')approveTv()">
+    <button onclick="approveTv()">允许这台电视登录</button>
+    <div class="err" id="tvErr"></div>
+  </div>
+</div></div>
 <div id="gate"><div class="box">
   <h2>MediaFans</h2>
   <div class="dim">请登录</div>
@@ -2352,6 +2510,7 @@ PAGE_HTML = r"""<!doctype html>
   </div>
   <span id="whoami"></span>
   <button id="usersBtn" onclick="openUsers()">用户</button>
+  <button id="tvBtn" onclick="openTvPair('')" title="用这台手机/电脑的登录让电视登录">电视登录</button>
   <button id="loginBtn" onclick="openLogin()">网盘登录</button>
   <button id="outBtn" onclick="doLogout()" title="退出账号">退出</button>
   <select id="driveSel" title="当前网盘：我的网盘 / 剧集 / 一键找片都作用于此盘" onchange="setDrive(this.value)">
@@ -3173,6 +3332,48 @@ function enter() {
     if (t) t.style.display = 'none';
   }
   boot();
+  // 手机扫了电视上的二维码进来的（地址带 #tv=123456）：直接弹「允许」。
+  // 没登录的话先过登录框，登录完走到这里照样弹
+  const m = /[#&]tv=(\d{6})/.exec(location.hash);
+  if (m) {
+    history.replaceState(null, '', location.pathname + location.search);
+    openTvPair(m[1]);
+  }
+}
+
+// ---------------- 电视扫码登录 ----------------
+// 电视上用遥控器打用户名密码太折磨。电视显示一个二维码（= 本页地址 + #tv=码），
+// 手机扫了打开这里，点「允许」，服务端替当前用户给那台电视发一个新令牌。
+function openTvPair(code) {
+  $('#tvCode').value = code || '';
+  const who = me ? me.name.replace(/^_master$/, '管理员（访问令牌）') : '';
+  $('#tvWho').textContent = '电视将以「' + who + '」的身份登录，看到的是你的片库和观看进度。' +
+    (code ? '确认是你面前那台电视再点允许。' : '输入电视上显示的 6 位数字。');
+  $('#tvErr').textContent = '';
+  $('#tvErr').classList.remove('ok');
+  $('#tvPair').classList.add('on');
+  if (!code) setTimeout(() => { try { $('#tvCode').focus(); } catch (e) {} }, 50);
+}
+function closeTvPair() { $('#tvPair').classList.remove('on'); }
+
+async function approveTv() {
+  const code = $('#tvCode').value.replace(/\D/g, '');
+  const err = $('#tvErr');
+  err.classList.remove('ok');
+  if (code.length !== 6) { err.textContent = '是 6 位数字'; return; }
+  err.textContent = '正在通知电视…';
+  try {
+    const d = await (await fetch('/api/tv/pair/approve', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+    })).json();
+    if (d.error) throw new Error(d.error);
+    err.classList.add('ok');
+    err.textContent = '✓ 好了，电视几秒内会自己进去';
+    setTimeout(closeTvPair, 2500);
+  } catch (e) {
+    err.textContent = e.message || '失败了';
+  }
 }
 
 // ---------------- 防呆：忙碌态 ----------------

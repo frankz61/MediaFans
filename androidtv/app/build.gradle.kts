@@ -1,7 +1,19 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// 默认服务器地址（网页端地址栏那个，带入口路径）。电视上打一串网址太折磨，
+// 自家服务器就那一台，打包时写进去，首次打开直接出登录二维码。
+// 写在 local.properties 的 mediafans.server（不进仓库）；环境变量 MEDIAFANS_SERVER 优先。
+val defaultServer: String = run {
+    val props = Properties()
+    rootProject.file("local.properties").takeIf { it.exists() }
+        ?.inputStream()?.use { props.load(it) }
+    (System.getenv("MEDIAFANS_SERVER") ?: props.getProperty("mediafans.server") ?: "").trim()
 }
 
 android {
@@ -14,8 +26,10 @@ android {
         // 这里取 23 是因为 tv-material 的最低要求。
         minSdk = 23
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2"
+        versionCode = 4
+        versionName = "1.3"
+
+        buildConfigField("String", "DEFAULT_SERVER", "\"${defaultServer.replace("\"", "")}\"")
     }
 
     buildTypes {
@@ -33,7 +47,7 @@ android {
     }
     kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
 
-    buildFeatures { compose = true }
+    buildFeatures { compose = true; buildConfig = true }
 }
 
 dependencies {

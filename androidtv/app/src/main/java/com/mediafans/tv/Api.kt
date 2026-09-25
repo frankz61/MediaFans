@@ -55,6 +55,16 @@ class Settings(ctx: Context) {
         get() = sp.getString("subtitle", "")!!
         set(v) = sp.edit().putString("subtitle", v).apply()
 
+    /**
+     * 网页端地址（带防扫描入口路径的那个）。电视上的登录二维码就是它加 `#tv=码`，
+     * 手机扫了直接打开网页端。和 [base] 分开存：base 是接口所在的根，入口路径被剥掉了。
+     * 没填过就用打包时写进来的默认地址（local.properties 的 mediafans.server），
+     * 再没有就退到 base——二维码打开可能是 404，但屏幕上的数字码照样能手动输。
+     */
+    var page: String
+        get() = sp.getString("page", "")!!.ifEmpty { BuildConfig.DEFAULT_SERVER }.ifEmpty { base }
+        set(v) = sp.edit().putString("page", v.trim().trimEnd('/')).apply()
+
     val configured: Boolean get() = base.isNotEmpty()
 
     companion object {
@@ -114,6 +124,11 @@ data class Source(
 )
 
 data class Watched(val percent: Int, val finished: Boolean, val resumeAt: Int, val path: String)
+
+/** 电视扫码登录的一次配对。[qr] 是二维码点阵，一行一个字符串，'1' 是黑块；空 = 只有数字码。 */
+data class Pairing(val code: String, val secret: String, val qr: List<String>, val expiresIn: Int)
+
+data class PairState(val status: String, val token: String, val user: String)
 
 /** 外挂字幕。服务端已经转成 WebVTT 了（srt/ass 都是），这边只管挂上去。 */
 data class Subtitle(val label: String, val lang: String, val url: String)
@@ -355,6 +370,35 @@ class Api(private val settings: Settings) {
         request("POST", url("/api/login", base = base, auth = false),
             JSONObject().put("username", username).put("password", password).toString())
             .getString("token")
+
+    /**
+     * 电视扫码登录：要一个配对码。这一步不带令牌（电视这时候还没有）。
+     * [page] 是网页端地址，服务端拿它拼出二维码的点阵。
+     */
+    fun pairStart(base: String, page: String): Pairing {
+        val o = try {
+            request("POST", url("/api/tv/pair/start", base = base, auth = false),
+                JSONObject().put("page", page).toString())
+        } catch (e: ApiError) {
+            // 老服务端没有这个端点：它对不认识的 /api/ 一律回 401
+            if (e.needLogin) throw ApiError("服务端版本太旧，不支持扫码登录，先用账号密码登录")
+            throw e
+        }
+        val qr = o.optJSONArray("qr")
+        return Pairing(
+            code = o.getString("code"),
+            secret = o.getString("secret"),
+            qr = (0 until (qr?.length() ?: 0)).map { qr!!.getString(it) },
+            expiresIn = o.optInt("expires_in", 300),
+        )
+    }
+
+    /** 等网页端点「允许」。status：pending / ok（带 token、user）/ expired。 */
+    fun pairPoll(base: String, p: Pairing): PairState {
+        val o = request("GET", url("/api/tv/pair/poll",
+            mapOf("code" to p.code, "secret" to p.secret), base = base, auth = false))
+        return PairState(o.optString("status"), o.optString("token"), o.optString("user"))
+    }
 
     /** 当前令牌是谁。连带验证令牌还有没有效。 */
     fun me(): Me {
