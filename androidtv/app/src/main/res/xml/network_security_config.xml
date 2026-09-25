@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  电视盒子的系统普遍停在 Android 6/7.0，系统证书库里没有 ISRG 根，
+  Let's Encrypt 签的服务器一连就是
+  「Trust anchor for certification path not found」。
+  这里把 Let's Encrypt 的四个根打进 APK，和系统证书库一起信任。
+  7.0（API 24）起系统读这个文件；6.0 不认它，由 MediaFansApp 手动装同一批根。
+  清单：res/raw/isrg_root_*.pem，改这里记得同步 MediaFansApp.BUNDLED_ROOTS。
+-->
+<network-security-config>
+    <base-config>
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/isrg_root_x1" />
+            <certificates src="@raw/isrg_root_x2" />
+            <certificates src="@raw/isrg_root_ye" />
+            <certificates src="@raw/isrg_root_yr" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

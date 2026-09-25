@@ -8,7 +8,10 @@
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:name="android.software.leanback" android:required="false" />
 
+    <!-- networkSecurityConfig：老盒子系统证书库里没有 Let's Encrypt 的根，见该文件 -->
     <application
+        android:name=".MediaFansApp"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:allowBackup="true"
         android:banner="@drawable/banner"
         android:icon="@mipmap/ic_launcher"
